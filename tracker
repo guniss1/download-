@@ -14,15 +14,21 @@
     1. Добавьте бота в группу.
     2. Напишите: «трекер, ты тут?» - бот подключится к этой группе.
     3. /search 0.5%             - искать разницу цен от 0.5% между биржами.
-    4. /disable binance bybit   - выключить биржи (только в этой группе).
-    5. /enable binance bybit    - включить обратно (/enable all - включить все).
-    6. /status - текущие настройки, /stop - отключить уведомления в этой группе.
+    4. /minsize 100             - не показывать сигналы, где можно провернуть меньше $100.
+    5. /disable binance bybit   - выключить биржи (только в этой группе).
+    6. /enable binance bybit    - включить обратно (/enable all - включить все).
+    7. /status - текущие настройки, /stop - отключить уведомления в этой группе.
+
+Как работает проверка объёма: для каждого кандидата бот загружает стаканы обеих бирж
+и "проедает" их навстречу друг другу (покупка по ask, продажа по bid), пока сделка
+остаётся прибыльной после комиссий. Получается, на какую сумму реально можно
+купить и продать. Сигналы с малым объёмом (мусорные "пара тысяч токенов") не показываются.
 
 ВАЖНО: в @BotFather отключите Group Privacy (Bot Settings -> Group Privacy ->
 Turn off) и добавьте бота в группу заново, иначе он не увидит фразу
 «трекер, ты тут?» (при включённой приватности бот читает только команды).
 
-Ключи бирж не нужны: используются только публичные цены.
+Ключи бирж не нужны: используются только публичные цены и стаканы.
 """
 import asyncio
 import json
@@ -62,6 +68,13 @@ MAX_PER_MESSAGE = 10       # максимум аномалий в одном с�
 DEFAULT_THRESHOLD = 0.5    # порог по умолчанию, %
 CONFIG_PATH = Path("config.json")
 
+# Проверка глубины стакана
+MIN_TRADE_USDT = 100       # по умолчанию: меньше такой суммы сигнал считается мусором
+MAX_BOOK_CHECKS = 20       # сколько новых кандидатов проверять стаканами за одно сканирование
+BOOK_LIMIT = 50            # сколько уровней стакана загружать
+DEPTH_TTL = 45             # секунд, сколько результат проверки стакана считается свежим
+DEPTH_MAX_AGE = 120        # старше этого результат не используется
+
 # Ссылки на спотовую пару на каждой бирже (если формат сменится - правьте здесь)
 PAIR_URLS = {
     "binance": "https://www.binance.com/en/trade/{base}_{quote}?type=spot",
@@ -73,7 +86,7 @@ PAIR_URLS = {
     "weex": "https://www.weex.com/spot/{base}-{quote}",
 }
 
-# Расчёт «возможной прибыли с учётом комиссий» (приблизительный!)
+# Расчёт прибыли (приблизительный!)
 # Тейкер-комиссии спота без скидок и VIP-уровней - поставьте свои.
 TAKER_FEES = {
     "binance": 0.001,
@@ -85,7 +98,6 @@ TAKER_FEES = {
     "weex": 0.001,
 }
 DEFAULT_TAKER = 0.001
-TRADE_SIZE_USDT = 1000     # на какую сумму прикидываем сделку
 TRANSFER_FEE_USDT = 1.0    # примерная комиссия за перевод монеты между биржами, в USDT
 # -------------------------------------------
 
@@ -206,17 +218,6 @@ def describe(stats):
     return "; ".join(parts)
 
 
-def net_profit_pct(buy_ex, sell_ex, ask, bid):
-    """Прибыль в % после тейкер-комиссий на обеих биржах и примерной комиссии за перевод."""
-    fee_buy = TAKER_FEES.get(buy_ex, DEFAULT_TAKER)
-    fee_sell = TAKER_FEES.get(sell_ex, DEFAULT_TAKER)
-    cost = ask * (1 + fee_buy)
-    revenue = bid * (1 - fee_sell)
-    pct = (revenue / cost - 1) * 100
-    pct -= TRANSFER_FEE_USDT / TRADE_SIZE_USDT * 100
-    return pct
-
-
 def find_anomalies(data, min_pct):
     """data: {exchange: {symbol: (bid, ask, vol)}}. Покупка по минимальному ask,
     продажа по максимальному bid."""
@@ -244,7 +245,6 @@ def find_anomalies(data, min_pct):
                     "ask": ask,
                     "bid": bid,
                     "pct": pct,
-                    "net": net_profit_pct(buy_ex, sell_ex, ask, bid),
                     "vol_buy": per_ex[buy_ex][2],
                     "vol_sell": per_ex[sell_ex][2],
                 }
@@ -253,8 +253,106 @@ def find_anomalies(data, min_pct):
     return result
 
 
+# ---------- Глубина стакана ----------
+def depth_profit(asks, bids, buy_ex, sell_ex):
+    """Идём по стаканам навстречу друг другу: покупаем по ask, продаём по bid,
+    пока каждая следующая порция остаётся прибыльной после тейкер-комиссий.
+    Возвращает dict с объёмом и прибылью или None, если прибыльной порции нет."""
+    fee_buy = TAKER_FEES.get(buy_ex, DEFAULT_TAKER)
+    fee_sell = TAKER_FEES.get(sell_ex, DEFAULT_TAKER)
+
+    cost = revenue = qty = 0.0
+    i = j = 0
+    ask_left = bid_left = None
+    while i < len(asks) and j < len(bids):
+        pa, qa = float(asks[i][0]), float(asks[i][1])
+        pb, qb = float(bids[j][0]), float(bids[j][1])
+        if pb * (1 - fee_sell) <= pa * (1 + fee_buy):  # дальше сделка убыточна
+            break
+        if ask_left is None:
+            ask_left = qa
+        if bid_left is None:
+            bid_left = qb
+        take = min(ask_left, bid_left)
+        cost += take * pa
+        revenue += take * pb
+        qty += take
+        ask_left -= take
+        bid_left -= take
+        if ask_left <= 1e-12:
+            i += 1
+            ask_left = None
+        if bid_left <= 1e-12:
+            j += 1
+            bid_left = None
+
+    if qty <= 0 or cost <= 0:
+        return None
+    profit = revenue * (1 - fee_sell) - cost * (1 + fee_buy) - TRANSFER_FEE_USDT
+    return {
+        "usdt": cost,                 # на сколько $ можно купить
+        "qty": qty,                   # сколько монет
+        "revenue": revenue,           # сколько $ выручим при продаже
+        "profit": profit,             # чистая прибыль, $
+        "profit_pct": profit / (cost * (1 + fee_buy)) * 100,
+    }
+
+
+_book_warned = set()
+
+
+async def fetch_book(ex, symbol):
+    """Стакан или None. Сначала с ограничением глубины, при ошибке - без него."""
+    try:
+        return await asyncio.wait_for(ex.fetch_order_book(symbol, BOOK_LIMIT), 10)
+    except Exception:
+        pass
+    try:
+        return await asyncio.wait_for(ex.fetch_order_book(symbol), 10)
+    except Exception as e:
+        if ex.id not in _book_warned:
+            _book_warned.add(ex.id)
+            log.warning("%s: стакан %s не получен: %s", ex.id, symbol, str(e)[:200])
+        return None
+
+
+async def check_depth(by_id, items, cache):
+    """items: [(ckey, anomaly)], ckey = (symbol, buy_ex, sell_ex). Результат - в cache."""
+    needed = []
+    for (sym, buy_ex, sell_ex), _ in items:
+        for ex_id in (buy_ex, sell_ex):
+            if (ex_id, sym) not in needed:
+                needed.append((ex_id, sym))
+
+    books = await asyncio.gather(*[fetch_book(by_id[e], s) for e, s in needed])
+    book_map = dict(zip(needed, books))
+
+    now = time.time()
+    for (sym, buy_ex, sell_ex), _ in items:
+        buy_book = book_map.get((buy_ex, sym))
+        sell_book = book_map.get((sell_ex, sym))
+        info = None
+        if buy_book and sell_book:
+            info = depth_profit(buy_book["asks"], sell_book["bids"], buy_ex, sell_ex)
+        cache[(sym, buy_ex, sell_ex)] = (now, info)
+
+
+# ---------- Форматирование ----------
 def fmt_vol(v):
     return f"{v / 1e6:.1f}M" if v >= 1e6 else f"{v / 1e3:.0f}K"
+
+
+def usd(x):
+    return f"${x:,.0f}".replace(",", " ")
+
+
+def money(x):
+    sign = "-" if x < 0 else "+"
+    return f"{sign}${abs(x):,.2f}".replace(",", " ")
+
+
+def qty_str(q):
+    return f"{q:,.0f}".replace(",", " ") if q >= 100 else f"{q:.4g}"
 
 
 def pair_url(ex_id, symbol):
@@ -267,21 +365,27 @@ def pair_url(ex_id, symbol):
 def fmt_anomaly(a):
     buy_link = f'<a href="{pair_url(a["buy_ex"], a["symbol"])}">{a["buy_ex"]}</a>'
     sell_link = f'<a href="{pair_url(a["sell_ex"], a["symbol"])}">{a["sell_ex"]}</a>'
+    base = a["symbol"].split("/")[0]
     return (
         f"<b>{a['symbol']}</b>  +{a['pct']:.2f}%\n"
         f"Купить: {buy_link} по {a['ask']:.8g} (объём 24ч ${fmt_vol(a['vol_buy'])})\n"
         f"Продать: {sell_link} по {a['bid']:.8g} (объём 24ч ${fmt_vol(a['vol_sell'])})\n"
-        f"{'💰' if a['net'] > 0 else '⚠️'} Возможная прибыль с учётом комиссий: {a['net']:+.2f}%"
+        f"📦 Можно купить на {usd(a['usdt'])} ({qty_str(a['qty'])} {base}), "
+        f"продать за {usd(a['revenue'])}\n"
+        f"{'💰' if a['profit'] > 0 else '⚠️'} Прибыль с учётом комиссий: "
+        f"{money(a['profit'])} ({a['profit_pct']:+.2f}%)"
     )
 
 
 # ---------- Цикл сканирования ----------
 async def scanner_loop(app: Application):
     exchanges = app.bot_data["exchanges"]
+    by_id = {e.id: e for e in exchanges}
     cfg = app.bot_data["cfg"]
     down = set()
     sent = {}
     counted = set()
+    depth_cache = {}
 
     while True:
         try:
@@ -311,29 +415,56 @@ async def scanner_loop(app: Application):
                                      ex_id, len(tick), describe(stats))
                 app.bot_data["down"] = set(down)
 
+                # 1. кандидаты по каждой группе (по ценам из тикеров)
                 now = time.time()
+                chat_cands = {}
+                need = {}
                 for chat_id, c in list(chats.items()):
                     off = set(c.get("disabled", []))
                     chat_data = {k: v for k, v in data.items() if k not in off}
                     if len(chat_data) < 2:
                         continue
-
-                    fresh = []
+                    lst = []
                     for a in find_anomalies(chat_data, c["threshold"]):
-                        key = (chat_id, a["symbol"], a["buy_ex"], a["sell_ex"])
-                        if now - sent.get(key, 0) < COOLDOWN:
+                        ckey = (a["symbol"], a["buy_ex"], a["sell_ex"])
+                        if now - sent.get((chat_id,) + ckey, 0) < COOLDOWN:
                             continue
-                        fresh.append((key, a))
-                    if not fresh:
+                        lst.append((ckey, a))
+                        cached = depth_cache.get(ckey)
+                        if (not cached or now - cached[0] > DEPTH_TTL) and ckey not in need:
+                            need[ckey] = a
+                    if lst:
+                        chat_cands[chat_id] = (c, lst)
+
+                # 2. проверяем стаканы у самых выгодных новых кандидатов
+                to_check = sorted(need.items(), key=lambda kv: kv[1]["pct"], reverse=True)
+                to_check = to_check[:MAX_BOOK_CHECKS]
+                if to_check:
+                    await check_depth(by_id, to_check, depth_cache)
+
+                # 3. отправляем только то, где объём достаточный
+                now = time.time()
+                for chat_id, (c, lst) in chat_cands.items():
+                    min_usd = c.get("min_trade_usdt", MIN_TRADE_USDT)
+                    accepted = []
+                    for ckey, a in lst:
+                        cached = depth_cache.get(ckey)
+                        if not cached or now - cached[0] > DEPTH_MAX_AGE:
+                            continue
+                        info = cached[1]
+                        if info is None or info["usdt"] < min_usd:
+                            continue
+                        accepted.append(((chat_id,) + ckey, {**a, **info}))
+                    if not accepted:
                         continue
 
-                    shown = fresh[:MAX_PER_MESSAGE]
+                    shown = accepted[:MAX_PER_MESSAGE]
                     text = "\n\n".join(fmt_anomaly(a) for _, a in shown)
-                    if len(fresh) > len(shown):
-                        text += f"\n\n…и ещё {len(fresh) - len(shown)}"
+                    if len(accepted) > len(shown):
+                        text += f"\n\n…и ещё {len(accepted) - len(shown)}"
                     text += (
-                        f"\n\nПрибыль приблизительная: тейкер-комиссии обеих бирж + перевод "
-                        f"≈{TRANSFER_FEE_USDT:g} USDT на сумму {TRADE_SIZE_USDT} USDT. "
+                        f"\n\nПрибыль приблизительная: считается по стаканам до точки безубыточности "
+                        f"после тейкер-комиссий и перевода ≈{TRANSFER_FEE_USDT:g} USDT. "
                         "Реальные комиссии и статус вывода проверьте на бирже."
                     )
                     try:
@@ -348,6 +479,9 @@ async def scanner_loop(app: Application):
                 if len(sent) > 5000:
                     cutoff = time.time() - COOLDOWN
                     sent = {k: v for k, v in sent.items() if v > cutoff}
+                if len(depth_cache) > 2000:
+                    cutoff = time.time() - DEPTH_MAX_AGE
+                    depth_cache = {k: v for k, v in depth_cache.items() if v[0] > cutoff}
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -378,13 +512,18 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = str(update.effective_chat.id)
         chats = cfg.setdefault("chats", {})
         new = chat_id not in chats
-        chats.setdefault(chat_id, {"threshold": DEFAULT_THRESHOLD, "disabled": []})
+        chats.setdefault(
+            chat_id,
+            {"threshold": DEFAULT_THRESHOLD, "disabled": [], "min_trade_usdt": MIN_TRADE_USDT},
+        )
         save_config(cfg)
-        thr = chats[chat_id]["threshold"]
+        c = chats[chat_id]
         await msg.reply_text(
             ("Да, тут! Подключился к этой группе. " if new else "Да, тут! ")
-            + f"Присылаю разницу цен от {thr}% между биржами.\n"
+            + f"Присылаю разницу цен от {c['threshold']}% между биржами, "
+            f"если по стаканам можно провернуть от ${c.get('min_trade_usdt', MIN_TRADE_USDT):g}.\n"
             "Порог: /search 0.5%\n"
+            "Минимальный объём: /minsize 100\n"
             "Биржи: /disable binance bybit, /enable binance bybit\n"
             "Настройки: /status"
         )
@@ -413,6 +552,35 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat["threshold"] = value
     save_config(cfg)
     await msg.reply_text(f"Ищу разницу цен от {value}% между биржами.")
+
+
+async def minsize_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    cfg = context.application.bot_data["cfg"]
+    chat = get_chat(context, update)
+
+    if chat is None:
+        await msg.reply_text("Сначала напишите в чате: «трекер, ты тут?»")
+        return
+    current = chat.get("min_trade_usdt", MIN_TRADE_USDT)
+    if not context.args:
+        await msg.reply_text(
+            f"Сейчас показываю сигналы, где можно провернуть от ${current:g}.\n"
+            "Изменить: /minsize 200"
+        )
+        return
+    try:
+        value = float(context.args[0].replace("$", "").replace(",", "."))
+    except ValueError:
+        await msg.reply_text("Не понял число. Пример: /minsize 100")
+        return
+    if not (1 <= value <= 1_000_000):
+        await msg.reply_text("Сумма должна быть от $1 до $1 000 000.")
+        return
+
+    chat["min_trade_usdt"] = value
+    save_config(cfg)
+    await msg.reply_text(f"Показываю только сигналы, где можно провернуть от ${value:g}.")
 
 
 def parse_names(args):
@@ -487,7 +655,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     off = set(chat.get("disabled", []))
     enabled = [e for e in EXCHANGES if e not in off]
     lines = [
-        f"Уведомления включены, порог {chat['threshold']}%",
+        f"Уведомления включены, порог {chat['threshold']}%, "
+        f"мин. объём ${chat.get('min_trade_usdt', MIN_TRADE_USDT):g}",
         "Включены: " + (", ".join(enabled) or "нет"),
     ]
     if off:
@@ -560,6 +729,7 @@ def main():
     )
     app.bot_data["cfg"] = cfg
     app.add_handler(CommandHandler("search", search_cmd))
+    app.add_handler(CommandHandler("minsize", minsize_cmd))
     app.add_handler(CommandHandler("enable", enable_cmd))
     app.add_handler(CommandHandler("disable", disable_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
