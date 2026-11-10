@@ -19,20 +19,28 @@
     6. /enable binance bybit    - включить обратно (/enable all - включить все).
     7. /status - текущие настройки, /stop - отключить уведомления в этой группе.
 
-Как работает проверка объёма: для каждого кандидата бот загружает стаканы обеих бирж
-и "проедает" их навстречу друг другу (покупка по ask, продажа по bid), пока сделка
-остаётся прибыльной после комиссий. Получается, на какую сумму реально можно
-купить и продать. Сигналы с малым объёмом (мусорные "пара тысяч токенов") не показываются.
+Как читать сообщение:
+    INIT/USDT [+6.5%:+6.6%] 🔴      - диапазон разницы цен по выгодным ордерам, статус вывода
+    Выгодных ордеров                - уровни стакана на покупке, где разница >= порога /search
+    N)+x%: цена: [$цена:$сумма]: кол-во - один ордер (сумма: K - тысячи, M - миллионы)
+    Купля / Продажа                 - биржа, цена (или диапазон цен), суточный объём
+    Доступ к выводу                 - 🟢 монету можно вывести с биржи покупки и ввести на бирже
+                                      продажи (есть общая сеть), 🔴 нельзя, ⚪ неизвестно
+
+Статус вывода/ввода биржи отдают только по API-ключам. Создайте ключи ТОЛЬКО НА ЧТЕНИЕ
+(без торговли и без вывода, с привязкой к вашему IP) и передайте их одним из способов:
+    export BYBIT_API_KEY=...  BYBIT_API_SECRET=...     (для OKX и Bitget ещё *_API_PASSWORD)
+    или в config.json:  "keys": {"bybit": {"apiKey": "...", "secret": "..."}}
+Без ключей у этой биржи статус будет ⚪ (неизвестно).
 
 ВАЖНО: в @BotFather отключите Group Privacy (Bot Settings -> Group Privacy ->
 Turn off) и добавьте бота в группу заново, иначе он не увидит фразу
 «трекер, ты тут?» (при включённой приватности бот читает только команды).
-
-Ключи бирж не нужны: используются только публичные цены и стаканы.
 """
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -59,12 +67,18 @@ except ImportError:  # более старые версии
 
 # ---------------- Настройки ----------------
 EXCHANGES = ["binance", "bybit", "bitget", "okx", "mexc", "bingx", "weex"]
+EX_NAMES = {
+    "binance": "Binance", "bybit": "Bybit", "bitget": "Bitget", "okx": "OKX",
+    "mexc": "MEXC", "bingx": "BingX", "weex": "WEEX",
+}
 QUOTE = "USDT"             # сравниваем только пары к USDT
 SCAN_INTERVAL = 15         # секунд между сканированиями
 MIN_VOLUME_USDT = 100_000  # игнорировать пары с суточным объёмом меньше (на бирже)
 MAX_SPREAD_PCT = 30        # разница больше - почти наверняка разные монеты с одним тикером
 COOLDOWN = 600             # не повторять один и тот же сигнал чаще, чем раз в N секунд
-MAX_PER_MESSAGE = 10       # максимум аномалий в одном сообщении
+MAX_PER_MESSAGE = 10       # максимум аномалий в одной группе за одно сканирование
+MAX_ORDER_LINES = 8        # сколько ордеров перечислять в сообщении
+MAX_MESSAGE_CHARS = 3500   # лимит Telegram 4096, оставляем запас
 DEFAULT_THRESHOLD = 0.5    # порог по умолчанию, %
 CONFIG_PATH = Path("config.json")
 
@@ -72,8 +86,12 @@ CONFIG_PATH = Path("config.json")
 MIN_TRADE_USDT = 100       # по умолчанию: меньше такой суммы сигнал считается мусором
 MAX_BOOK_CHECKS = 20       # сколько новых кандидатов проверять стаканами за одно сканирование
 BOOK_LIMIT = 50            # сколько уровней стакана загружать
-DEPTH_TTL = 45             # секунд, сколько результат проверки стакана считается свежим
-DEPTH_MAX_AGE = 120        # старше этого результат не используется
+DEPTH_TTL = 45             # секунд, сколько стакан считается свежим (повторно не грузим)
+DEPTH_MAX_AGE = 120        # старше этого стакан не используется
+
+# Статусы ввода/вывода монет
+CURRENCY_TTL = 1800        # как часто обновлять статусы (секунд)
+CURRENCY_RETRY = 300       # через сколько повторить, если получить не удалось
 
 # Ссылки на спотовую пару на каждой бирже (если формат сменится - правьте здесь)
 PAIR_URLS = {
@@ -85,20 +103,6 @@ PAIR_URLS = {
     "bingx": "https://bingx.com/en/spot/{base}{quote}/",
     "weex": "https://www.weex.com/spot/{base}-{quote}",
 }
-
-# Расчёт прибыли (приблизительный!)
-# Тейкер-комиссии спота без скидок и VIP-уровней - поставьте свои.
-TAKER_FEES = {
-    "binance": 0.001,
-    "bybit": 0.001,
-    "bitget": 0.001,
-    "okx": 0.001,
-    "mexc": 0.0005,
-    "bingx": 0.001,
-    "weex": 0.001,
-}
-DEFAULT_TAKER = 0.001
-TRANSFER_FEE_USDT = 1.0    # примерная комиссия за перевод монеты между биржами, в USDT
 # -------------------------------------------
 
 logging.basicConfig(
@@ -128,6 +132,22 @@ def get_token(cfg):
         cfg["token"] = token
         save_config(cfg)  # токен хранится в config.json открытым текстом
     return token
+
+
+def exchange_params(cfg, name):
+    """Параметры ccxt. Если заданы API-ключи (только чтение!), добавляем их."""
+    params = {"enableRateLimit": True, "options": {"defaultType": "spot"}}
+    stored = (cfg.get("keys") or {}).get(name, {})
+    env = name.upper()
+    key = os.environ.get(f"{env}_API_KEY") or stored.get("apiKey")
+    secret = os.environ.get(f"{env}_API_SECRET") or stored.get("secret")
+    password = os.environ.get(f"{env}_API_PASSWORD") or stored.get("password")
+    if key and secret:
+        params["apiKey"] = key
+        params["secret"] = secret
+        if password:
+            params["password"] = password
+    return params
 
 
 # ---------- Данные бирж ----------
@@ -254,29 +274,37 @@ def find_anomalies(data, min_pct):
 
 
 # ---------- Глубина стакана ----------
-def depth_profit(asks, bids, buy_ex, sell_ex):
+def depth_orders(asks, bids, thr_pct):
     """Идём по стаканам навстречу друг другу: покупаем по ask, продаём по bid,
-    пока каждая следующая порция остаётся прибыльной после тейкер-комиссий.
-    Возвращает dict с объёмом и прибылью или None, если прибыльной порции нет."""
-    fee_buy = TAKER_FEES.get(buy_ex, DEFAULT_TAKER)
-    fee_sell = TAKER_FEES.get(sell_ex, DEFAULT_TAKER)
-
-    cost = revenue = qty = 0.0
+    пока разница цен на текущей паре уровней не меньше порога thr_pct.
+    Возвращает список "выгодных ордеров" (уровни ask) и итоги или None."""
+    orders = []
+    sell_hi = 0.0
+    sell_lo = float("inf")
+    cost = revenue = qty_total = 0.0
     i = j = 0
     ask_left = bid_left = None
     while i < len(asks) and j < len(bids):
         pa, qa = float(asks[i][0]), float(asks[i][1])
         pb, qb = float(bids[j][0]), float(bids[j][1])
-        if pb * (1 - fee_sell) <= pa * (1 + fee_buy):  # дальше сделка убыточна
+        if pa <= 0 or (pb / pa - 1) * 100 < thr_pct:
             break
         if ask_left is None:
             ask_left = qa
         if bid_left is None:
             bid_left = qb
         take = min(ask_left, bid_left)
+
+        if not orders or orders[-1]["i"] != i:
+            orders.append({"i": i, "price": pa, "qty": 0.0, "rev": 0.0})
+        orders[-1]["qty"] += take
+        orders[-1]["rev"] += take * pb
         cost += take * pa
         revenue += take * pb
-        qty += take
+        qty_total += take
+        sell_hi = max(sell_hi, pb)
+        sell_lo = min(sell_lo, pb)
+
         ask_left -= take
         bid_left -= take
         if ask_left <= 1e-12:
@@ -286,15 +314,20 @@ def depth_profit(asks, bids, buy_ex, sell_ex):
             j += 1
             bid_left = None
 
-    if qty <= 0 or cost <= 0:
+    orders = [o for o in orders if o["qty"] > 0]
+    if not orders or cost <= 0:
         return None
-    profit = revenue * (1 - fee_sell) - cost * (1 + fee_buy) - TRANSFER_FEE_USDT
+    for o in orders:
+        o["margin"] = (o["rev"] / (o["qty"] * o["price"]) - 1) * 100
     return {
+        "orders": orders,
         "usdt": cost,                 # на сколько $ можно купить
-        "qty": qty,                   # сколько монет
-        "revenue": revenue,           # сколько $ выручим при продаже
-        "profit": profit,             # чистая прибыль, $
-        "profit_pct": profit / (cost * (1 + fee_buy)) * 100,
+        "qty": qty_total,
+        "revenue": revenue,
+        "buy_lo": orders[0]["price"],
+        "buy_hi": orders[-1]["price"],
+        "sell_hi": sell_hi,
+        "sell_lo": sell_lo,
     }
 
 
@@ -316,39 +349,120 @@ async def fetch_book(ex, symbol):
         return None
 
 
-async def check_depth(by_id, items, cache):
-    """items: [(ckey, anomaly)], ckey = (symbol, buy_ex, sell_ex). Результат - в cache."""
-    needed = []
-    for (sym, buy_ex, sell_ex), _ in items:
-        for ex_id in (buy_ex, sell_ex):
-            if (ex_id, sym) not in needed:
-                needed.append((ex_id, sym))
-
-    books = await asyncio.gather(*[fetch_book(by_id[e], s) for e, s in needed])
-    book_map = dict(zip(needed, books))
-
+async def refresh_books(by_id, keys, cache):
+    """keys: [(ex_id, symbol)]. Кладёт свежие стаканы в cache[(ex_id, symbol)] = (время, стакан|None)."""
+    books = await asyncio.gather(*[fetch_book(by_id[e], s) for e, s in keys])
     now = time.time()
-    for (sym, buy_ex, sell_ex), _ in items:
-        buy_book = book_map.get((buy_ex, sym))
-        sell_book = book_map.get((sell_ex, sym))
-        info = None
-        if buy_book and sell_book:
-            info = depth_profit(buy_book["asks"], sell_book["bids"], buy_ex, sell_ex)
-        cache[(sym, buy_ex, sell_ex)] = (now, info)
+    for k, b in zip(keys, books):
+        cache[k] = (now, b)
+
+
+# ---------- Статус ввода/вывода ----------
+_cur_warned = set()
+
+
+async def load_currencies(ex):
+    try:
+        data = await asyncio.wait_for(ex.fetch_currencies(), 60)
+        return (data or None), None
+    except Exception as e:
+        return None, str(e)[:200]
+
+
+async def currency_loop(app: Application):
+    """Фоново обновляет статусы ввода/вывода монет для включённых бирж."""
+    exchanges = app.bot_data["exchanges"]
+    store = app.bot_data["currencies"]  # {ex_id: {"time": ts, "cur": {код: валюта} | None}}
+    while True:
+        try:
+            wanted = set()
+            for c in app.bot_data["cfg"].get("chats", {}).values():
+                wanted |= set(EXCHANGES) - set(c.get("disabled", []))
+            now = time.time()
+            due = [
+                e for e in exchanges
+                if e.id in wanted and now - store.get(e.id, {}).get("time", 0) > CURRENCY_TTL
+            ]
+            if due:
+                results = await asyncio.gather(*[load_currencies(e) for e in due])
+                for ex, (data, err) in zip(due, results):
+                    if data:
+                        store[ex.id] = {"time": time.time(), "cur": data}
+                        log.info("%s: статусы ввода/вывода получены для %d монет", ex.id, len(data))
+                    else:
+                        prev = store.get(ex.id, {}).get("cur")
+                        store[ex.id] = {"time": time.time() - CURRENCY_TTL + CURRENCY_RETRY, "cur": prev}
+                        if ex.id not in _cur_warned:
+                            _cur_warned.add(ex.id)
+                            log.info(
+                                "%s: статусов ввода/вывода нет (обычно нужны API-ключи только на чтение). %s",
+                                ex.id, err or "",
+                            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Ошибка в обновлении статусов монет")
+        await asyncio.sleep(30)
+
+
+def _norm(name):
+    return re.sub(r"[^A-Z0-9]", "", str(name).upper())
+
+
+def transfer_status(currencies, buy_ex, sell_ex, base):
+    """True - можно вывести с биржи покупки и ввести на бирже продажи (есть общая сеть),
+    False - нельзя, None - неизвестно."""
+    cb = (currencies.get(buy_ex) or {}).get("cur")
+    cs = (currencies.get(sell_ex) or {}).get("cur")
+    if not cb or not cs:
+        return None
+    b, s = cb.get(base), cs.get(base)
+    if not b or not s:
+        return None
+
+    can_withdraw, can_deposit = b.get("withdraw"), s.get("deposit")
+    if can_withdraw is False or can_deposit is False:
+        return False
+
+    nets_b, nets_s = b.get("networks") or {}, s.get("networks") or {}
+    if nets_b and nets_s:
+        out_b = {_norm(k) for k, v in nets_b.items() if (v or {}).get("withdraw") is not False}
+        in_s = {_norm(k) for k, v in nets_s.items() if (v or {}).get("deposit") is not False}
+        return bool(out_b & in_s)
+    if can_withdraw is True and can_deposit is True:
+        return True
+    return None
 
 
 # ---------- Форматирование ----------
+def trunc1(x):
+    """Округление вниз до 0.1 (как в образце: 6.66% -> 6.6%)."""
+    return math.floor(x * 10 + 1e-9) / 10
+
+
 def fmt_vol(v):
     return f"{v / 1e6:.1f}M" if v >= 1e6 else f"{v / 1e3:.0f}K"
 
 
-def usd(x):
-    return f"${x:,.0f}".replace(",", " ")
+def fmt_k(x):
+    if x >= 1e6:
+        return f"{x / 1e6:.2f}M"
+    if x >= 1e3:
+        return f"{x / 1e3:.2f}K"
+    return f"{x:.2f}"
 
 
-def money(x):
-    sign = "-" if x < 0 else "+"
-    return f"{sign}${abs(x):,.2f}".replace(",", " ")
+def fmt_price(p):
+    s = f"{p:.10f}".rstrip("0").rstrip(".")
+    return s or "0"
+
+
+def short_price(p):
+    """Цена с двумя значащими цифрами: 0.21344 -> 0.21, 0.00123 -> 0.0012."""
+    if p <= 0:
+        return "0"
+    decimals = max(2, -math.floor(math.log10(p)) + 1)
+    return f"{p:.{decimals}f}"
 
 
 def qty_str(q):
@@ -362,19 +476,61 @@ def pair_url(ex_id, symbol):
     )
 
 
+def ex_link(ex_id, symbol):
+    return f'<a href="{pair_url(ex_id, symbol)}">{EX_NAMES.get(ex_id, ex_id)}</a>'
+
+
+def price_range(first, second):
+    a, b = fmt_price(first), fmt_price(second)
+    return a if a == b else f"[{a}:{b}]"
+
+
+def status_emoji(status):
+    return {True: "🟢", False: "🔴"}.get(status, "⚪")
+
+
 def fmt_anomaly(a):
-    buy_link = f'<a href="{pair_url(a["buy_ex"], a["symbol"])}">{a["buy_ex"]}</a>'
-    sell_link = f'<a href="{pair_url(a["sell_ex"], a["symbol"])}">{a["sell_ex"]}</a>'
+    orders = a["orders"]
     base = a["symbol"].split("/")[0]
-    return (
-        f"<b>{a['symbol']}</b>  +{a['pct']:.2f}%\n"
-        f"Купить: {buy_link} по {a['ask']:.8g} (объём 24ч ${fmt_vol(a['vol_buy'])})\n"
-        f"Продать: {sell_link} по {a['bid']:.8g} (объём 24ч ${fmt_vol(a['vol_sell'])})\n"
-        f"📦 Можно купить на {usd(a['usdt'])} ({qty_str(a['qty'])} {base}), "
-        f"продать за {usd(a['revenue'])}\n"
-        f"{'💰' if a['profit'] > 0 else '⚠️'} Прибыль с учётом комиссий: "
-        f"{money(a['profit'])} ({a['profit_pct']:+.2f}%)"
+    margins = [o["margin"] for o in orders]
+    lo, hi = trunc1(min(margins)), trunc1(max(margins))
+
+    header = f"<b>{a['symbol']} [+{lo:.1f}%:+{hi:.1f}%]</b> {status_emoji(a['transfer'])}"
+
+    body = [f" • <b>Выгодных ордеров:</b> {len(orders)}"]
+    for n, o in enumerate(orders[:MAX_ORDER_LINES], 1):
+        amount = o["qty"] * o["price"]
+        body.append(
+            f"{n})+{trunc1(o['margin']):.1f}%: {fmt_price(o['price'])}: "
+            f"[${short_price(o['price'])}:${fmt_k(amount)}]: {qty_str(o['qty'])} {base}"
+        )
+    if len(orders) > MAX_ORDER_LINES:
+        body.append(f"…и ещё {len(orders) - MAX_ORDER_LINES}")
+    body.append(
+        f" • <b>Купля:</b> {ex_link(a['buy_ex'], a['symbol'])} "
+        f"{price_range(a['buy_lo'], a['buy_hi'])} (24vol ${fmt_vol(a['vol_buy'])})"
     )
+    body.append(
+        f" • <b>Продажа:</b> {ex_link(a['sell_ex'], a['symbol'])} "
+        f"{price_range(a['sell_hi'], a['sell_lo'])} (24vol ${fmt_vol(a['vol_sell'])})"
+    )
+    body.append(f" • <b>Доступ к выводу:</b> {status_emoji(a['transfer'])}")
+
+    return header + "\n<blockquote>" + "\n".join(body) + "</blockquote>"
+
+
+def chunk_blocks(items):
+    """items: [(key, text)] -> группы так, чтобы каждое сообщение влезало в лимит Telegram."""
+    chunks, cur, size = [], [], 0
+    for key, text in items:
+        if cur and size + len(text) + 2 > MAX_MESSAGE_CHARS:
+            chunks.append(cur)
+            cur, size = [], 0
+        cur.append((key, text))
+        size += len(text) + 2
+    if cur:
+        chunks.append(cur)
+    return chunks
 
 
 # ---------- Цикл сканирования ----------
@@ -382,10 +538,14 @@ async def scanner_loop(app: Application):
     exchanges = app.bot_data["exchanges"]
     by_id = {e.id: e for e in exchanges}
     cfg = app.bot_data["cfg"]
+    currencies = app.bot_data["currencies"]
     down = set()
     sent = {}
     counted = set()
-    depth_cache = {}
+    book_cache = {}
+
+    def fresh(entry, now):
+        return bool(entry) and now - entry[0] <= DEPTH_TTL
 
     while True:
         try:
@@ -418,7 +578,7 @@ async def scanner_loop(app: Application):
                 # 1. кандидаты по каждой группе (по ценам из тикеров)
                 now = time.time()
                 chat_cands = {}
-                need = {}
+                cand_all = {}
                 for chat_id, c in list(chats.items()):
                     off = set(c.get("disabled", []))
                     chat_data = {k: v for k, v in data.items() if k not in off}
@@ -430,58 +590,72 @@ async def scanner_loop(app: Application):
                         if now - sent.get((chat_id,) + ckey, 0) < COOLDOWN:
                             continue
                         lst.append((ckey, a))
-                        cached = depth_cache.get(ckey)
-                        if (not cached or now - cached[0] > DEPTH_TTL) and ckey not in need:
-                            need[ckey] = a
+                        cand_all[ckey] = max(cand_all.get(ckey, 0), a["pct"])
                     if lst:
                         chat_cands[chat_id] = (c, lst)
 
-                # 2. проверяем стаканы у самых выгодных новых кандидатов
-                to_check = sorted(need.items(), key=lambda kv: kv[1]["pct"], reverse=True)
-                to_check = to_check[:MAX_BOOK_CHECKS]
-                if to_check:
-                    await check_depth(by_id, to_check, depth_cache)
+                # 2. загружаем стаканы у самых выгодных кандидатов (свежие берём из кэша)
+                need_books, checked = [], 0
+                for ckey, _pct in sorted(cand_all.items(), key=lambda kv: kv[1], reverse=True):
+                    sym, buy_ex, sell_ex = ckey
+                    missing = [(e, sym) for e in (buy_ex, sell_ex)
+                               if not fresh(book_cache.get((e, sym)), now)]
+                    if not missing:
+                        continue
+                    checked += 1
+                    if checked > MAX_BOOK_CHECKS:
+                        break
+                    for k in missing:
+                        if k not in need_books:
+                            need_books.append(k)
+                if need_books:
+                    await refresh_books(by_id, need_books, book_cache)
 
-                # 3. отправляем только то, где объём достаточный
+                # 3. считаем ордера по порогу каждой группы и отправляем, если объём достаточный
                 now = time.time()
                 for chat_id, (c, lst) in chat_cands.items():
+                    thr = c["threshold"]
                     min_usd = c.get("min_trade_usdt", MIN_TRADE_USDT)
                     accepted = []
                     for ckey, a in lst:
-                        cached = depth_cache.get(ckey)
-                        if not cached or now - cached[0] > DEPTH_MAX_AGE:
+                        sym, buy_ex, sell_ex = ckey
+                        bb, sb = book_cache.get((buy_ex, sym)), book_cache.get((sell_ex, sym))
+                        if not bb or not sb or not bb[1] or not sb[1]:
                             continue
-                        info = cached[1]
+                        if now - bb[0] > DEPTH_MAX_AGE or now - sb[0] > DEPTH_MAX_AGE:
+                            continue
+                        info = depth_orders(bb[1]["asks"], sb[1]["bids"], thr)
                         if info is None or info["usdt"] < min_usd:
                             continue
+                        info["transfer"] = transfer_status(
+                            currencies, buy_ex, sell_ex, sym.split("/")[0]
+                        )
                         accepted.append(((chat_id,) + ckey, {**a, **info}))
                     if not accepted:
                         continue
 
                     shown = accepted[:MAX_PER_MESSAGE]
-                    text = "\n\n".join(fmt_anomaly(a) for _, a in shown)
-                    if len(accepted) > len(shown):
-                        text += f"\n\n…и ещё {len(accepted) - len(shown)}"
-                    text += (
-                        f"\n\nПрибыль приблизительная: считается по стаканам до точки безубыточности "
-                        f"после тейкер-комиссий и перевода ≈{TRANSFER_FEE_USDT:g} USDT. "
-                        "Реальные комиссии и статус вывода проверьте на бирже."
-                    )
-                    try:
-                        await app.bot.send_message(
-                            int(chat_id), text, parse_mode=ParseMode.HTML, **SEND_KW
-                        )
-                        for key, _ in shown:
-                            sent[key] = now
-                    except Exception as e:
-                        log.warning("Не удалось отправить в %s: %s", chat_id, e)
+                    chunks = chunk_blocks([(key, fmt_anomaly(a)) for key, a in shown])
+                    for n, chunk in enumerate(chunks):
+                        text = "\n\n".join(t for _, t in chunk)
+                        if n == len(chunks) - 1 and len(accepted) > len(shown):
+                            text += f"\n\n…и ещё {len(accepted) - len(shown)}"
+                        try:
+                            await app.bot.send_message(
+                                int(chat_id), text, parse_mode=ParseMode.HTML, **SEND_KW
+                            )
+                            for key, _ in chunk:
+                                sent[key] = now
+                        except Exception as e:
+                            log.warning("Не удалось отправить в %s: %s", chat_id, e)
+                            break
 
                 if len(sent) > 5000:
                     cutoff = time.time() - COOLDOWN
                     sent = {k: v for k, v in sent.items() if v > cutoff}
-                if len(depth_cache) > 2000:
+                if len(book_cache) > 3000:
                     cutoff = time.time() - DEPTH_MAX_AGE
-                    depth_cache = {k: v for k, v in depth_cache.items() if v[0] > cutoff}
+                    book_cache = {k: v for k, v in book_cache.items() if v[0] > cutoff}
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -669,6 +843,13 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(
             "Нет в установленной ccxt: " + ", ".join(missing) + " (pip install -U ccxt)"
         )
+
+    store = bd.get("currencies", {})
+    known = [e for e in enabled if (store.get(e) or {}).get("cur")]
+    unknown = [e for e in enabled if e not in known]
+    lines.append("Статус вывода известен: " + (", ".join(known) or "ни для одной биржи"))
+    if unknown:
+        lines.append("Статус вывода неизвестен (⚪, нужны API-ключи на чтение): " + ", ".join(unknown))
     await msg.reply_text("\n".join(lines))
 
 
@@ -686,30 +867,35 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Запуск ----------
 async def post_init(app: Application):
+    cfg = app.bot_data["cfg"]
     exchanges, missing = [], []
     for name in EXCHANGES:
         cls = getattr(ccxt, name, None)
         if cls is None:
             missing.append(name)
             continue
-        exchanges.append(
-            cls({"enableRateLimit": True, "options": {"defaultType": "spot"}})
-        )
+        exchanges.append(cls(exchange_params(cfg, name)))
     if missing:
         log.warning(
             "В установленной ccxt нет бирж: %s. Обновите: pip install -U ccxt",
             ", ".join(missing),
         )
+    keyed = [e.id for e in exchanges if getattr(e, "apiKey", None)]
+    log.info("API-ключи (чтение) заданы для: %s", ", ".join(keyed) or "нет ни для одной биржи")
+
     app.bot_data["exchanges"] = exchanges
     app.bot_data["missing"] = missing
     app.bot_data["down"] = set()
-    app.bot_data["task"] = asyncio.create_task(scanner_loop(app))
+    app.bot_data["currencies"] = {}
+    app.bot_data["tasks"] = [
+        asyncio.create_task(scanner_loop(app)),
+        asyncio.create_task(currency_loop(app)),
+    ]
     log.info("Бот запущен. Биржи: %s", ", ".join(e.id for e in exchanges))
 
 
 async def post_shutdown(app: Application):
-    task = app.bot_data.get("task")
-    if task:
+    for task in app.bot_data.get("tasks", []):
         task.cancel()
     for ex in app.bot_data.get("exchanges", []):
         await ex.close()
