@@ -1,0 +1,572 @@
+"""
+Трекер аномалий цен: Binance, Bybit, Bitget, OKX, MEXC, BingX, WEEX -> уведомления в Telegram.
+
+Установка:
+    pip install -U ccxt "python-telegram-bot>=20"
+    (ccxt нужен свежий: в старых версиях нет некоторых бирж, например WEEX)
+
+Запуск:
+    python tracker_bot.py
+    (токен бота берётся из переменной TG_BOT_TOKEN, из config.json,
+     а если его нет нигде, скрипт спросит его при первом запуске)
+
+Как пользоваться в группе:
+    1. Добавьте бота в группу.
+    2. Напишите: «трекер, ты тут?» - бот подключится к этой группе.
+    3. /search 0.5%             - искать разницу цен от 0.5% между биржами.
+    4. /disable binance bybit   - выключить биржи (только в этой группе).
+    5. /enable binance bybit    - включить обратно (/enable all - включить все).
+    6. /status - текущие настройки, /stop - отключить уведомления в этой группе.
+
+ВАЖНО: в @BotFather отключите Group Privacy (Bot Settings -> Group Privacy ->
+Turn off) и добавьте бота в группу заново, иначе он не увидит фразу
+«трекер, ты тут?» (при включённой приватности бот читает только команды).
+
+Ключи бирж не нужны: используются только публичные цены.
+"""
+import asyncio
+import json
+import logging
+import os
+import re
+import time
+from collections import defaultdict
+from pathlib import Path
+
+import ccxt.async_support as ccxt
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+try:  # python-telegram-bot >= 20.8
+    from telegram import LinkPreviewOptions
+
+    SEND_KW = {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
+except ImportError:  # более старые версии
+    SEND_KW = {"disable_web_page_preview": True}
+
+# ---------------- Настройки ----------------
+EXCHANGES = ["binance", "bybit", "bitget", "okx", "mexc", "bingx", "weex"]
+QUOTE = "USDT"             # сравниваем только пары к USDT
+SCAN_INTERVAL = 15         # секунд между сканированиями
+MIN_VOLUME_USDT = 100_000  # игнорировать пары с суточным объёмом меньше (на бирже)
+MAX_SPREAD_PCT = 30        # разница больше - почти наверняка разные монеты с одним тикером
+COOLDOWN = 600             # не повторять один и тот же сигнал чаще, чем раз в N секунд
+MAX_PER_MESSAGE = 10       # максимум аномалий в одном сообщении
+DEFAULT_THRESHOLD = 0.5    # порог по умолчанию, %
+CONFIG_PATH = Path("config.json")
+
+# Ссылки на спотовую пару на каждой бирже (если формат сменится - правьте здесь)
+PAIR_URLS = {
+    "binance": "https://www.binance.com/en/trade/{base}_{quote}?type=spot",
+    "bybit": "https://www.bybit.com/en/trade/spot/{base}/{quote}",
+    "bitget": "https://www.bitget.com/spot/{base}{quote}",
+    "okx": "https://www.okx.com/trade-spot/{base_l}-{quote_l}",
+    "mexc": "https://www.mexc.com/exchange/{base}_{quote}",
+    "bingx": "https://bingx.com/en/spot/{base}{quote}/",
+    "weex": "https://www.weex.com/spot/{base}-{quote}",
+}
+
+# Расчёт «возможной прибыли с учётом комиссий» (приблизительный!)
+# Тейкер-комиссии спота без скидок и VIP-уровней - поставьте свои.
+TAKER_FEES = {
+    "binance": 0.001,
+    "bybit": 0.001,
+    "bitget": 0.001,
+    "okx": 0.001,
+    "mexc": 0.0005,
+    "bingx": 0.001,
+    "weex": 0.001,
+}
+DEFAULT_TAKER = 0.001
+TRADE_SIZE_USDT = 1000     # на какую сумму прикидываем сделку
+TRANSFER_FEE_USDT = 1.0    # примерная комиссия за перевод монеты между биржами, в USDT
+# -------------------------------------------
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO
+)
+log = logging.getLogger("tracker")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+# ---------- Конфиг ----------
+def load_config():
+    if CONFIG_PATH.exists():
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    return {}
+
+
+def save_config(cfg):
+    CONFIG_PATH.write_text(
+        json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def get_token(cfg):
+    token = os.environ.get("TG_BOT_TOKEN") or cfg.get("token")
+    if not token:
+        token = input("Вставьте токен бота от @BotFather: ").strip()
+        cfg["token"] = token
+        save_config(cfg)  # токен хранится в config.json открытым текстом
+    return token
+
+
+# ---------- Данные бирж ----------
+def collect(rows, stats):
+    """rows: (symbol, bid, ask, timestamp_ms, quote_volume). Считает причины отсева в stats."""
+    now_ms = time.time() * 1000
+    out = {}
+    for sym, bid, ask, ts, vol in rows:
+        stats["total"] += 1
+        if not sym.endswith("/" + QUOTE) or ":" in sym:
+            stats["не_спот_usdt"] += 1
+            continue
+        if not bid or not ask or bid <= 0 or ask <= 0:
+            stats["нет_bid_ask"] += 1
+            continue
+        if ts and now_ms - ts > 120_000:  # устаревшая котировка
+            stats["устарела"] += 1
+            continue
+        if (vol or 0) < MIN_VOLUME_USDT:
+            stats["малый_объём"] += 1
+            continue
+        out[sym] = (bid, ask, vol)
+    return out
+
+
+def _num(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def weex_raw(ex, stats):
+    """Запасной путь для WEEX: напрямую публичный эндпоинт ticker/24hr
+    (в нём есть bidPrice, askPrice и quoteVolume)."""
+    resp = await ex.publicGetApiV3MarketTicker24hr()
+    items = resp.get("data", resp) if isinstance(resp, dict) else resp
+    rows = []
+    for t in items or []:
+        raw = str(t.get("symbol", ""))
+        if not raw.endswith(QUOTE):
+            continue
+        sym = f"{raw[:-len(QUOTE)]}/{QUOTE}"
+        rows.append(
+            (sym, _num(t.get("bidPrice")), _num(t.get("askPrice")), None,
+             _num(t.get("quoteVolume")))
+        )
+    return collect(rows, stats)
+
+
+# биржи, для которых при пустом результате ccxt пробуем прямой запрос
+RAW_FALLBACK = {"weex": weex_raw}
+
+
+async def fetch_exchange(ex):
+    """Возвращает (id биржи, {symbol: (bid, ask, объём_usdt)} или None, текст ошибки, статистика)."""
+    stats = defaultdict(int)
+    try:
+        tickers = await ex.fetch_tickers()
+    except Exception as e:
+        log.debug("%s: %s", ex.id, e)
+        return ex.id, None, str(e)[:200], stats
+
+    rows = []
+    for sym, t in tickers.items():
+        vol = t.get("quoteVolume") or (t.get("baseVolume") or 0) * (t.get("last") or 0)
+        rows.append((sym, t.get("bid"), t.get("ask"), t.get("timestamp"), vol))
+    out = collect(rows, stats)
+    stats["sample"] = list(tickers)[:3]
+
+    if not out and ex.id in RAW_FALLBACK:
+        raw_stats = defaultdict(int)
+        try:
+            out = await RAW_FALLBACK[ex.id](ex, raw_stats)
+            stats["через_прямой_запрос"] = len(out)
+            stats["прямой_запрос_всего"] = raw_stats["total"]
+        except Exception as e:
+            log.warning("%s: прямой запрос не удался: %s", ex.id, str(e)[:200])
+    return ex.id, out, None, stats
+
+
+def describe(stats):
+    keys = ["total", "не_спот_usdt", "нет_bid_ask", "устарела", "малый_объём",
+            "через_прямой_запрос", "прямой_запрос_всего"]
+    parts = [f"{k}={stats[k]}" for k in keys if stats.get(k)]
+    if stats.get("sample"):
+        parts.append("примеры=" + ",".join(stats["sample"]))
+    return "; ".join(parts)
+
+
+def net_profit_pct(buy_ex, sell_ex, ask, bid):
+    """Прибыль в % после тейкер-комиссий на обеих биржах и примерной комиссии за перевод."""
+    fee_buy = TAKER_FEES.get(buy_ex, DEFAULT_TAKER)
+    fee_sell = TAKER_FEES.get(sell_ex, DEFAULT_TAKER)
+    cost = ask * (1 + fee_buy)
+    revenue = bid * (1 - fee_sell)
+    pct = (revenue / cost - 1) * 100
+    pct -= TRANSFER_FEE_USDT / TRADE_SIZE_USDT * 100
+    return pct
+
+
+def find_anomalies(data, min_pct):
+    """data: {exchange: {symbol: (bid, ask, vol)}}. Покупка по минимальному ask,
+    продажа по максимальному bid."""
+    by_symbol = {}
+    for ex_id, tick in data.items():
+        for sym, v in tick.items():
+            by_symbol.setdefault(sym, {})[ex_id] = v
+
+    result = []
+    for sym, per_ex in by_symbol.items():
+        if len(per_ex) < 2:
+            continue
+        buy_ex = min(per_ex, key=lambda e: per_ex[e][1])
+        sell_ex = max(per_ex, key=lambda e: per_ex[e][0])
+        if buy_ex == sell_ex:
+            continue
+        ask, bid = per_ex[buy_ex][1], per_ex[sell_ex][0]
+        pct = (bid / ask - 1) * 100
+        if min_pct <= pct <= MAX_SPREAD_PCT:
+            result.append(
+                {
+                    "symbol": sym,
+                    "buy_ex": buy_ex,
+                    "sell_ex": sell_ex,
+                    "ask": ask,
+                    "bid": bid,
+                    "pct": pct,
+                    "net": net_profit_pct(buy_ex, sell_ex, ask, bid),
+                    "vol_buy": per_ex[buy_ex][2],
+                    "vol_sell": per_ex[sell_ex][2],
+                }
+            )
+    result.sort(key=lambda a: a["pct"], reverse=True)
+    return result
+
+
+def fmt_vol(v):
+    return f"{v / 1e6:.1f}M" if v >= 1e6 else f"{v / 1e3:.0f}K"
+
+
+def pair_url(ex_id, symbol):
+    base, quote = symbol.split("/")
+    return PAIR_URLS[ex_id].format(
+        base=base, quote=quote, base_l=base.lower(), quote_l=quote.lower()
+    )
+
+
+def fmt_anomaly(a):
+    buy_link = f'<a href="{pair_url(a["buy_ex"], a["symbol"])}">{a["buy_ex"]}</a>'
+    sell_link = f'<a href="{pair_url(a["sell_ex"], a["symbol"])}">{a["sell_ex"]}</a>'
+    return (
+        f"<b>{a['symbol']}</b>  +{a['pct']:.2f}%\n"
+        f"Купить: {buy_link} по {a['ask']:.8g} (объём 24ч ${fmt_vol(a['vol_buy'])})\n"
+        f"Продать: {sell_link} по {a['bid']:.8g} (объём 24ч ${fmt_vol(a['vol_sell'])})\n"
+        f"{'💰' if a['net'] > 0 else '⚠️'} Возможная прибыль с учётом комиссий: {a['net']:+.2f}%"
+    )
+
+
+# ---------- Цикл сканирования ----------
+async def scanner_loop(app: Application):
+    exchanges = app.bot_data["exchanges"]
+    cfg = app.bot_data["cfg"]
+    down = set()
+    sent = {}
+    counted = set()
+
+    while True:
+        try:
+            chats = cfg.get("chats", {})
+            if chats:
+                # опрашиваем только те биржи, которые включены хотя бы в одной группе
+                wanted = set()
+                for c in chats.values():
+                    wanted |= set(EXCHANGES) - set(c.get("disabled", []))
+                to_fetch = [e for e in exchanges if e.id in wanted]
+
+                results = await asyncio.gather(*[fetch_exchange(e) for e in to_fetch])
+                data = {}
+                for ex_id, tick, err, stats in results:
+                    if tick is None:
+                        if ex_id not in down:
+                            log.warning("%s недоступна: %s", ex_id, err)
+                            down.add(ex_id)
+                    else:
+                        if ex_id in down:
+                            log.info("%s снова доступна", ex_id)
+                            down.discard(ex_id)
+                        data[ex_id] = tick
+                        if ex_id not in counted:
+                            counted.add(ex_id)
+                            log.info("%s: %d пар в сканировании (%s)",
+                                     ex_id, len(tick), describe(stats))
+                app.bot_data["down"] = set(down)
+
+                now = time.time()
+                for chat_id, c in list(chats.items()):
+                    off = set(c.get("disabled", []))
+                    chat_data = {k: v for k, v in data.items() if k not in off}
+                    if len(chat_data) < 2:
+                        continue
+
+                    fresh = []
+                    for a in find_anomalies(chat_data, c["threshold"]):
+                        key = (chat_id, a["symbol"], a["buy_ex"], a["sell_ex"])
+                        if now - sent.get(key, 0) < COOLDOWN:
+                            continue
+                        fresh.append((key, a))
+                    if not fresh:
+                        continue
+
+                    shown = fresh[:MAX_PER_MESSAGE]
+                    text = "\n\n".join(fmt_anomaly(a) for _, a in shown)
+                    if len(fresh) > len(shown):
+                        text += f"\n\n…и ещё {len(fresh) - len(shown)}"
+                    text += (
+                        f"\n\nПрибыль приблизительная: тейкер-комиссии обеих бирж + перевод "
+                        f"≈{TRANSFER_FEE_USDT:g} USDT на сумму {TRADE_SIZE_USDT} USDT. "
+                        "Реальные комиссии и статус вывода проверьте на бирже."
+                    )
+                    try:
+                        await app.bot.send_message(
+                            int(chat_id), text, parse_mode=ParseMode.HTML, **SEND_KW
+                        )
+                        for key, _ in shown:
+                            sent[key] = now
+                    except Exception as e:
+                        log.warning("Не удалось отправить в %s: %s", chat_id, e)
+
+                if len(sent) > 5000:
+                    cutoff = time.time() - COOLDOWN
+                    sent = {k: v for k, v in sent.items() if v > cutoff}
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Ошибка в цикле сканирования")
+        await asyncio.sleep(SCAN_INTERVAL)
+
+
+# ---------- Обработчики Telegram ----------
+def normalize(text):
+    t = text.lower().replace("ё", "е")
+    t = re.sub(r"[^\w\s]", " ", t)
+    return " ".join(t.split())
+
+
+def get_chat(context, update):
+    """Настройки текущего чата или None, если чат не подключён."""
+    cfg = context.application.bot_data["cfg"]
+    return cfg.setdefault("chats", {}).get(str(update.effective_chat.id))
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return
+    t = normalize(msg.text)
+    if "трекер" in t and "ты тут" in t:
+        cfg = context.application.bot_data["cfg"]
+        chat_id = str(update.effective_chat.id)
+        chats = cfg.setdefault("chats", {})
+        new = chat_id not in chats
+        chats.setdefault(chat_id, {"threshold": DEFAULT_THRESHOLD, "disabled": []})
+        save_config(cfg)
+        thr = chats[chat_id]["threshold"]
+        await msg.reply_text(
+            ("Да, тут! Подключился к этой группе. " if new else "Да, тут! ")
+            + f"Присылаю разницу цен от {thr}% между биржами.\n"
+            "Порог: /search 0.5%\n"
+            "Биржи: /disable binance bybit, /enable binance bybit\n"
+            "Настройки: /status"
+        )
+
+
+async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    cfg = context.application.bot_data["cfg"]
+    chat = get_chat(context, update)
+
+    if chat is None:
+        await msg.reply_text("Сначала напишите в чате: «трекер, ты тут?»")
+        return
+    if not context.args:
+        await msg.reply_text("Формат: /search 0.5%")
+        return
+    try:
+        value = float(context.args[0].replace("%", "").replace(",", "."))
+    except ValueError:
+        await msg.reply_text("Не понял число. Пример: /search 0.5%")
+        return
+    if not (0.05 <= value <= MAX_SPREAD_PCT):
+        await msg.reply_text(f"Порог должен быть от 0.05% до {MAX_SPREAD_PCT}%.")
+        return
+
+    chat["threshold"] = value
+    save_config(cfg)
+    await msg.reply_text(f"Ищу разницу цен от {value}% между биржами.")
+
+
+def parse_names(args):
+    names = []
+    for raw in args:
+        for part in raw.replace(",", " ").split():
+            names.append(part.lower())
+    return names
+
+
+async def toggle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, enable: bool):
+    msg = update.effective_message
+    cfg = context.application.bot_data["cfg"]
+    chat = get_chat(context, update)
+    cmd = "/enable" if enable else "/disable"
+
+    if chat is None:
+        await msg.reply_text("Сначала напишите в чате: «трекер, ты тут?»")
+        return
+
+    names = parse_names(context.args)
+    if not names:
+        await msg.reply_text(
+            f"Формат: {cmd} binance bybit\nБиржи: " + ", ".join(EXCHANGES)
+            + ("\nВключить все: /enable all" if enable else "")
+        )
+        return
+
+    disabled = set(chat.get("disabled", []))
+    unknown = []
+    if enable and names == ["all"]:
+        disabled.clear()
+    else:
+        valid = [n for n in names if n in EXCHANGES]
+        unknown = [n for n in names if n not in EXCHANGES]
+        if enable:
+            disabled -= set(valid)
+        else:
+            disabled |= set(valid)
+
+    chat["disabled"] = [e for e in EXCHANGES if e in disabled]
+    save_config(cfg)
+
+    enabled = [e for e in EXCHANGES if e not in disabled]
+    lines = []
+    if unknown:
+        lines.append("Не знаю такие биржи: " + ", ".join(unknown))
+    lines.append("Включены: " + (", ".join(enabled) or "нет"))
+    if disabled:
+        lines.append("Выключены: " + ", ".join(e for e in EXCHANGES if e in disabled))
+    if len(enabled) < 2:
+        lines.append("⚠️ Нужно минимум 2 включённые биржи, иначе сравнивать нечего.")
+    await msg.reply_text("\n".join(lines))
+
+
+async def enable_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await toggle_cmd(update, context, True)
+
+
+async def disable_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await toggle_cmd(update, context, False)
+
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat = get_chat(context, update)
+    if chat is None:
+        await msg.reply_text("Уведомления выключены. Включить: «трекер, ты тут?»")
+        return
+
+    bd = context.application.bot_data
+    off = set(chat.get("disabled", []))
+    enabled = [e for e in EXCHANGES if e not in off]
+    lines = [
+        f"Уведомления включены, порог {chat['threshold']}%",
+        "Включены: " + (", ".join(enabled) or "нет"),
+    ]
+    if off:
+        lines.append("Выключены: " + ", ".join(e for e in EXCHANGES if e in off))
+    unavailable = [e for e in enabled if e in bd.get("down", set())]
+    if unavailable:
+        lines.append("Не отвечают сейчас: " + ", ".join(unavailable))
+    missing = bd.get("missing", [])
+    if missing:
+        lines.append(
+            "Нет в установленной ccxt: " + ", ".join(missing) + " (pip install -U ccxt)"
+        )
+    await msg.reply_text("\n".join(lines))
+
+
+async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg = context.application.bot_data["cfg"]
+    chats = cfg.setdefault("chats", {})
+    if chats.pop(str(update.effective_chat.id), None) is not None:
+        save_config(cfg)
+        await update.effective_message.reply_text(
+            "Уведомления в этом чате выключены. Включить: «трекер, ты тут?»"
+        )
+    else:
+        await update.effective_message.reply_text("Уведомления и так выключены.")
+
+
+# ---------- Запуск ----------
+async def post_init(app: Application):
+    exchanges, missing = [], []
+    for name in EXCHANGES:
+        cls = getattr(ccxt, name, None)
+        if cls is None:
+            missing.append(name)
+            continue
+        exchanges.append(
+            cls({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+        )
+    if missing:
+        log.warning(
+            "В установленной ccxt нет бирж: %s. Обновите: pip install -U ccxt",
+            ", ".join(missing),
+        )
+    app.bot_data["exchanges"] = exchanges
+    app.bot_data["missing"] = missing
+    app.bot_data["down"] = set()
+    app.bot_data["task"] = asyncio.create_task(scanner_loop(app))
+    log.info("Бот запущен. Биржи: %s", ", ".join(e.id for e in exchanges))
+
+
+async def post_shutdown(app: Application):
+    task = app.bot_data.get("task")
+    if task:
+        task.cancel()
+    for ex in app.bot_data.get("exchanges", []):
+        await ex.close()
+
+
+def main():
+    cfg = load_config()
+    cfg.setdefault("chats", {})
+    token = get_token(cfg)
+
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+    app.bot_data["cfg"] = cfg
+    app.add_handler(CommandHandler("search", search_cmd))
+    app.add_handler(CommandHandler("enable", enable_cmd))
+    app.add_handler(CommandHandler("disable", disable_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("stop", stop_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
