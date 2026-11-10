@@ -1,42 +1,31 @@
 """
-Трекер аномалий цен: Binance, Bybit, Bitget, OKX, MEXC, BingX, WEEX -> уведомления в Telegram.
+Трекер аномалий цен: Binance, Bybit, Bitget, OKX, MEXC, BingX, WEEX -> Telegram.
 
 Установка:
-    pip install -U ccxt "python-telegram-bot>=20"
-    (ccxt нужен свежий: в старых версиях нет некоторых бирж, например WEEX)
+    pip install -U ccxt aiohttp "python-telegram-bot>=20"
 
 Запуск:
     python tracker_bot.py
-    (токен бота берётся из переменной TG_BOT_TOKEN, из config.json,
-     а если его нет нигде, скрипт спросит его при первом запуске)
 
-Как пользоваться в группе:
-    1. Добавьте бота в группу.
-    2. Напишите: «трекер, ты тут?» - бот подключится к этой группе.
-    3. /search 0.5%             - искать разницу цен от 0.5% между биржами.
-    4. /minsize 100             - не показывать сигналы, где можно провернуть меньше $100.
-    5. /disable binance bybit   - выключить биржи (только в этой группе).
-    6. /enable binance bybit    - включить обратно (/enable all - включить все).
-    7. /status - текущие настройки, /stop - отключить уведомления в этой группе.
+Токен: TG_BOT_TOKEN или config.json; если отсутствует, будет запрошен.
 
-Как читать сообщение:
-    INIT/USDT [+6.5%:+6.6%] 🔴      - диапазон разницы цен по выгодным ордерам, статус вывода
-    Выгодных ордеров                - уровни стакана на покупке, где разница >= порога /search
-    N)+x%: цена: [$цена:$сумма]: кол-во - один ордер (сумма: K - тысячи, M - миллионы)
-    Купля / Продажа                 - биржа, цена (или диапазон цен), суточный объём
-    Доступ к выводу                 - 🟢 монету можно вывести с биржи покупки и ввести на бирже
-                                      продажи (есть общая сеть), 🔴 нельзя, ⚪ неизвестно
+API-ключи бирж необязательны для получения цен. Для статусов ввода/вывода
+могут понадобиться ключи только на чтение (без торговли и без вывода).
 
-Статус вывода/ввода биржи отдают только по API-ключам. Создайте ключи ТОЛЬКО НА ЧТЕНИЕ
-(без торговли и без вывода, с привязкой к вашему IP) и передайте их одним из способов:
-    export BYBIT_API_KEY=...  BYBIT_API_SECRET=...     (для OKX и Bitget ещё *_API_PASSWORD)
-    или в config.json:  "keys": {"bybit": {"apiKey": "...", "secret": "..."}}
-Без ключей у этой биржи статус будет ⚪ (неизвестно).
+Индикаторы перевода:
+    🟢 Вывод и ввод разрешены, сеть совпадает, контракты подтверждены.
+    🔴 Операция закрыта, общей сети нет или адреса контрактов различаются.
+    🟡 Данных недостаточно для строгого подтверждения.
+    ⚪ Данных о статусе нет.
 
-ВАЖНО: в @BotFather отключите Group Privacy (Bot Settings -> Group Privacy ->
-Turn off) и добавьте бота в группу заново, иначе он не увидит фразу
-«трекер, ты тут?» (при включённой приватности бот читает только команды).
+Важно:
+    Биржи не всегда отдают адрес контракта через API.
+    В таком случае строгая проверка намеренно не ставит 🟢, а показывает 🟡.
+    Совпадение тикера не гарантирует идентичность токена.
+    Перед реальным переводом проверяйте сеть, адрес, комиссии и лимиты
+    непосредственно в интерфейсах бирж.
 """
+
 import asyncio
 import json
 import logging
@@ -47,7 +36,9 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+import aiohttp
 import ccxt.async_support as ccxt
+
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -58,42 +49,63 @@ from telegram.ext import (
     filters,
 )
 
-try:  # python-telegram-bot >= 20.8
+try:
     from telegram import LinkPreviewOptions
-
-    SEND_KW = {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
-except ImportError:  # более старые версии
+    SEND_KW = {
+        "link_preview_options": LinkPreviewOptions(is_disabled=True)
+    }
+except ImportError:
     SEND_KW = {"disable_web_page_preview": True}
 
-# ---------------- Настройки ----------------
-EXCHANGES = ["binance", "bybit", "bitget", "okx", "mexc", "bingx", "weex"]
+
+# ---------------- НАСТРОЙКИ ----------------
+
+EXCHANGES = [
+    "binance",
+    "bybit",
+    "bitget",
+    "okx",
+    "mexc",
+    "bingx",
+    "weex",
+]
+
 EX_NAMES = {
-    "binance": "Binance", "bybit": "Bybit", "bitget": "Bitget", "okx": "OKX",
-    "mexc": "MEXC", "bingx": "BingX", "weex": "WEEX",
+    "binance": "Binance",
+    "bybit": "Bybit",
+    "bitget": "Bitget",
+    "okx": "OKX",
+    "mexc": "MEXC",
+    "bingx": "BingX",
+    "weex": "WEEX",
 }
-QUOTE = "USDT"             # сравниваем только пары к USDT
-SCAN_INTERVAL = 15         # секунд между сканированиями
-MIN_VOLUME_USDT = 100_000  # игнорировать пары с суточным объёмом меньше (на бирже)
-MAX_SPREAD_PCT = 30        # разница больше - почти наверняка разные монеты с одним тикером
-COOLDOWN = 600             # не повторять один и тот же сигнал чаще, чем раз в N секунд
-MAX_PER_MESSAGE = 10       # максимум аномалий в одной группе за одно сканирование
-MAX_ORDER_LINES = 8        # сколько ордеров перечислять в сообщении
-MAX_MESSAGE_CHARS = 3500   # лимит Telegram 4096, оставляем запас
-DEFAULT_THRESHOLD = 0.5    # порог по умолчанию, %
+
+QUOTE = "USDT"
+
+SCAN_INTERVAL = 15
+MIN_VOLUME_USDT = 100_000
+MAX_SPREAD_PCT = 30
+COOLDOWN = 600
+
+MAX_PER_MESSAGE = 10
+MAX_ORDER_LINES = 8
+MAX_MESSAGE_CHARS = 3500
+
+DEFAULT_THRESHOLD = 0.5
 CONFIG_PATH = Path("config.json")
 
 # Проверка глубины стакана
-MIN_TRADE_USDT = 100       # по умолчанию: меньше такой суммы сигнал считается мусором
-MAX_BOOK_CHECKS = 20       # сколько новых кандидатов проверять стаканами за одно сканирование
-BOOK_LIMIT = 50            # сколько уровней стакана загружать
-DEPTH_TTL = 45             # секунд, сколько стакан считается свежим (повторно не грузим)
-DEPTH_MAX_AGE = 120        # старше этого стакан не используется
+MIN_TRADE_USDT = 100
+MAX_BOOK_CHECKS = 20
+BOOK_LIMIT = 50
+DEPTH_TTL = 45
+DEPTH_MAX_AGE = 120
 
-# Статусы ввода/вывода монет
-CURRENCY_TTL = 1800        # как часто обновлять статусы (секунд)
-CURRENCY_RETRY = 300       # через сколько повторить, если получить не удалось
+# Статусы ввода/вывода
+CURRENCY_TTL = 1800
+CURRENCY_RETRY = 300
 
-# Ссылки на спотовую пару на каждой бирже (если формат сменится - правьте здесь)
+# Ссылки на торговые пары
 PAIR_URLS = {
     "binance": "https://www.binance.com/en/trade/{base}_{quote}?type=spot",
     "bybit": "https://www.bybit.com/en/trade/spot/{base}/{quote}",
@@ -103,73 +115,137 @@ PAIR_URLS = {
     "bingx": "https://bingx.com/en/spot/{base}{quote}/",
     "weex": "https://www.weex.com/spot/{base}-{quote}",
 }
-# -------------------------------------------
+
+# --------------------------------------------
+
 
 logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO
+    format="%(asctime)s %(levelname)s %(message)s",
+    level=logging.INFO,
 )
+
 log = logging.getLogger("tracker")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-# ---------- Конфиг ----------
+# ============================================================
+# КОНФИГУРАЦИЯ
+# ============================================================
+
 def load_config():
     if CONFIG_PATH.exists():
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        try:
+            return json.loads(
+                CONFIG_PATH.read_text(encoding="utf-8")
+            )
+        except (json.JSONDecodeError, OSError) as e:
+            log.warning("Не удалось прочитать config.json: %s", e)
+
     return {}
 
 
 def save_config(cfg):
     CONFIG_PATH.write_text(
-        json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(cfg, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
 
 
 def get_token(cfg):
     token = os.environ.get("TG_BOT_TOKEN") or cfg.get("token")
+
     if not token:
-        token = input("Вставьте токен бота от @BotFather: ").strip()
+        token = input(
+            "Вставьте токен бота от @BotFather: "
+        ).strip()
+
+        if not token:
+            raise RuntimeError("Не указан TG_BOT_TOKEN.")
+
         cfg["token"] = token
-        save_config(cfg)  # токен хранится в config.json открытым текстом
+        save_config(cfg)
+
     return token
 
 
 def exchange_params(cfg, name):
-    """Параметры ccxt. Если заданы API-ключи (только чтение!), добавляем их."""
-    params = {"enableRateLimit": True, "options": {"defaultType": "spot"}}
+    """
+    Параметры CCXT.
+    Ключи добавляются только если заданы пользователем.
+    Рекомендуется создавать ключи без торговых прав и права вывода.
+    """
+
+    params = {
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": "spot",
+        },
+    }
+
     stored = (cfg.get("keys") or {}).get(name, {})
     env = name.upper()
-    key = os.environ.get(f"{env}_API_KEY") or stored.get("apiKey")
-    secret = os.environ.get(f"{env}_API_SECRET") or stored.get("secret")
-    password = os.environ.get(f"{env}_API_PASSWORD") or stored.get("password")
+
+    key = (
+        os.environ.get(f"{env}_API_KEY")
+        or stored.get("apiKey")
+    )
+
+    secret = (
+        os.environ.get(f"{env}_API_SECRET")
+        or stored.get("secret")
+    )
+
+    password = (
+        os.environ.get(f"{env}_API_PASSWORD")
+        or stored.get("password")
+    )
+
     if key and secret:
         params["apiKey"] = key
         params["secret"] = secret
+
         if password:
             params["password"] = password
+
     return params
 
 
-# ---------- Данные бирж ----------
+# ============================================================
+# ПОЛУЧЕНИЕ ЦЕН
+# ============================================================
+
 def collect(rows, stats):
-    """rows: (symbol, bid, ask, timestamp_ms, quote_volume). Считает причины отсева в stats."""
+    """
+    rows:
+        (symbol, bid, ask, timestamp_ms, quote_volume)
+
+    Возвращает подходящие спотовые пары USDT.
+    """
+
     now_ms = time.time() * 1000
     out = {}
+
     for sym, bid, ask, ts, vol in rows:
         stats["total"] += 1
+
         if not sym.endswith("/" + QUOTE) or ":" in sym:
             stats["не_спот_usdt"] += 1
             continue
+
         if not bid or not ask or bid <= 0 or ask <= 0:
             stats["нет_bid_ask"] += 1
             continue
-        if ts and now_ms - ts > 120_000:  # устаревшая котировка
+
+        if ts and now_ms - ts > 120_000:
             stats["устарела"] += 1
             continue
+
         if (vol or 0) < MIN_VOLUME_USDT:
             stats["малый_объём"] += 1
             continue
+
         out[sym] = (bid, ask, vol)
+
     return out
 
 
@@ -181,81 +257,173 @@ def _num(x):
 
 
 async def weex_raw(ex, stats):
-    """Запасной путь для WEEX: напрямую публичный эндпоинт ticker/24hr
-    (в нём есть bidPrice, askPrice и quoteVolume)."""
+    """
+    Запасной путь для WEEX:
+    публичный ticker/24hr endpoint.
+    """
+
     resp = await ex.publicGetApiV3MarketTicker24hr()
-    items = resp.get("data", resp) if isinstance(resp, dict) else resp
+
+    items = (
+        resp.get("data", resp)
+        if isinstance(resp, dict)
+        else resp
+    )
+
     rows = []
+
     for t in items or []:
         raw = str(t.get("symbol", ""))
+
         if not raw.endswith(QUOTE):
             continue
+
         sym = f"{raw[:-len(QUOTE)]}/{QUOTE}"
+
         rows.append(
-            (sym, _num(t.get("bidPrice")), _num(t.get("askPrice")), None,
-             _num(t.get("quoteVolume")))
+            (
+                sym,
+                _num(t.get("bidPrice")),
+                _num(t.get("askPrice")),
+                None,
+                _num(t.get("quoteVolume")),
+            )
         )
+
     return collect(rows, stats)
 
 
-# биржи, для которых при пустом результате ccxt пробуем прямой запрос
-RAW_FALLBACK = {"weex": weex_raw}
+RAW_FALLBACK = {
+    "weex": weex_raw,
+}
 
 
 async def fetch_exchange(ex):
-    """Возвращает (id биржи, {symbol: (bid, ask, объём_usdt)} или None, текст ошибки, статистика)."""
+    """
+    Возвращает:
+        exchange_id,
+        данные,
+        ошибка,
+        статистика.
+    """
+
     stats = defaultdict(int)
+
     try:
         tickers = await ex.fetch_tickers()
+
     except Exception as e:
         log.debug("%s: %s", ex.id, e)
-        return ex.id, None, str(e)[:200], stats
+
+        return (
+            ex.id,
+            None,
+            str(e)[:200],
+            stats,
+        )
 
     rows = []
+
     for sym, t in tickers.items():
-        vol = t.get("quoteVolume") or (t.get("baseVolume") or 0) * (t.get("last") or 0)
-        rows.append((sym, t.get("bid"), t.get("ask"), t.get("timestamp"), vol))
+        vol = (
+            t.get("quoteVolume")
+            or (t.get("baseVolume") or 0) * (t.get("last") or 0)
+        )
+
+        rows.append(
+            (
+                sym,
+                t.get("bid"),
+                t.get("ask"),
+                t.get("timestamp"),
+                vol,
+            )
+        )
+
     out = collect(rows, stats)
+
     stats["sample"] = list(tickers)[:3]
 
     if not out and ex.id in RAW_FALLBACK:
         raw_stats = defaultdict(int)
+
         try:
             out = await RAW_FALLBACK[ex.id](ex, raw_stats)
+
             stats["через_прямой_запрос"] = len(out)
             stats["прямой_запрос_всего"] = raw_stats["total"]
+
         except Exception as e:
-            log.warning("%s: прямой запрос не удался: %s", ex.id, str(e)[:200])
+            log.warning(
+                "%s: прямой запрос не удался: %s",
+                ex.id,
+                str(e)[:200],
+            )
+
     return ex.id, out, None, stats
 
 
 def describe(stats):
-    keys = ["total", "не_спот_usdt", "нет_bid_ask", "устарела", "малый_объём",
-            "через_прямой_запрос", "прямой_запрос_всего"]
-    parts = [f"{k}={stats[k]}" for k in keys if stats.get(k)]
+    keys = [
+        "total",
+        "не_спот_usdt",
+        "нет_bid_ask",
+        "устарела",
+        "малый_объём",
+        "через_прямой_запрос",
+        "прямой_запрос_всего",
+    ]
+
+    parts = [
+        f"{k}={stats[k]}"
+        for k in keys
+        if stats.get(k)
+    ]
+
     if stats.get("sample"):
-        parts.append("примеры=" + ",".join(stats["sample"]))
+        parts.append(
+            "примеры=" + ",".join(stats["sample"])
+        )
+
     return "; ".join(parts)
 
 
 def find_anomalies(data, min_pct):
-    """data: {exchange: {symbol: (bid, ask, vol)}}. Покупка по минимальному ask,
-    продажа по максимальному bid."""
+    """
+    Покупка по минимальному ask.
+    Продажа по максимальному bid.
+    """
+
     by_symbol = {}
+
     for ex_id, tick in data.items():
         for sym, v in tick.items():
             by_symbol.setdefault(sym, {})[ex_id] = v
 
     result = []
+
     for sym, per_ex in by_symbol.items():
         if len(per_ex) < 2:
             continue
-        buy_ex = min(per_ex, key=lambda e: per_ex[e][1])
-        sell_ex = max(per_ex, key=lambda e: per_ex[e][0])
+
+        buy_ex = min(
+            per_ex,
+            key=lambda e: per_ex[e][1],
+        )
+
+        sell_ex = max(
+            per_ex,
+            key=lambda e: per_ex[e][0],
+        )
+
         if buy_ex == sell_ex:
             continue
-        ask, bid = per_ex[buy_ex][1], per_ex[sell_ex][0]
+
+        ask = per_ex[buy_ex][1]
+        bid = per_ex[sell_ex][0]
+
         pct = (bid / ask - 1) * 100
+
         if min_pct <= pct <= MAX_SPREAD_PCT:
             result.append(
                 {
@@ -269,59 +437,108 @@ def find_anomalies(data, min_pct):
                     "vol_sell": per_ex[sell_ex][2],
                 }
             )
-    result.sort(key=lambda a: a["pct"], reverse=True)
+
+    result.sort(
+        key=lambda a: a["pct"],
+        reverse=True,
+    )
+
     return result
 
 
-# ---------- Глубина стакана ----------
+# ============================================================
+# ГЛУБИНА СТАКАНА
+# ============================================================
+
 def depth_orders(asks, bids, thr_pct):
-    """Идём по стаканам навстречу друг другу: покупаем по ask, продаём по bid,
-    пока разница цен на текущей паре уровней не меньше порога thr_pct.
-    Возвращает список "выгодных ордеров" (уровни ask) и итоги или None."""
+    """
+    Сопоставляет уровни покупки и продажи.
+    Считает объём, который можно исполнить при заданной разнице.
+    """
+
     orders = []
+
     sell_hi = 0.0
     sell_lo = float("inf")
-    cost = revenue = qty_total = 0.0
-    i = j = 0
-    ask_left = bid_left = None
+
+    cost = 0.0
+    revenue = 0.0
+    qty_total = 0.0
+
+    i = 0
+    j = 0
+
+    ask_left = None
+    bid_left = None
+
     while i < len(asks) and j < len(bids):
-        pa, qa = float(asks[i][0]), float(asks[i][1])
-        pb, qb = float(bids[j][0]), float(bids[j][1])
-        if pa <= 0 or (pb / pa - 1) * 100 < thr_pct:
+        pa = float(asks[i][0])
+        qa = float(asks[i][1])
+
+        pb = float(bids[j][0])
+        qb = float(bids[j][1])
+
+        if pa <= 0 or qa <= 0 or pb <= 0 or qb <= 0:
             break
+
+        if (pb / pa - 1) * 100 < thr_pct:
+            break
+
         if ask_left is None:
             ask_left = qa
+
         if bid_left is None:
             bid_left = qb
+
         take = min(ask_left, bid_left)
 
         if not orders or orders[-1]["i"] != i:
-            orders.append({"i": i, "price": pa, "qty": 0.0, "rev": 0.0})
+            orders.append(
+                {
+                    "i": i,
+                    "price": pa,
+                    "qty": 0.0,
+                    "rev": 0.0,
+                }
+            )
+
         orders[-1]["qty"] += take
         orders[-1]["rev"] += take * pb
+
         cost += take * pa
         revenue += take * pb
         qty_total += take
+
         sell_hi = max(sell_hi, pb)
         sell_lo = min(sell_lo, pb)
 
         ask_left -= take
         bid_left -= take
+
         if ask_left <= 1e-12:
             i += 1
             ask_left = None
+
         if bid_left <= 1e-12:
             j += 1
             bid_left = None
 
-    orders = [o for o in orders if o["qty"] > 0]
+    orders = [
+        o for o in orders
+        if o["qty"] > 0
+    ]
+
     if not orders or cost <= 0:
         return None
+
     for o in orders:
-        o["margin"] = (o["rev"] / (o["qty"] * o["price"]) - 1) * 100
+        o["margin"] = (
+            o["rev"] / (o["qty"] * o["price"]) - 1
+        ) * 100
+
     return {
         "orders": orders,
-        "usdt": cost,                 # на сколько $ можно купить
+        "usdt": cost,
         "qty": qty_total,
         "revenue": revenue,
         "buy_lo": orders[0]["price"],
@@ -335,575 +552,1800 @@ _book_warned = set()
 
 
 async def fetch_book(ex, symbol):
-    """Стакан или None. Сначала с ограничением глубины, при ошибке - без него."""
+    """
+    Получает стакан.
+    Сначала запрашивает ограниченную глубину.
+    """
+
     try:
-        return await asyncio.wait_for(ex.fetch_order_book(symbol, BOOK_LIMIT), 10)
+        return await asyncio.wait_for(
+            ex.fetch_order_book(symbol, BOOK_LIMIT),
+            10,
+        )
+
     except Exception:
         pass
+
     try:
-        return await asyncio.wait_for(ex.fetch_order_book(symbol), 10)
+        return await asyncio.wait_for(
+            ex.fetch_order_book(symbol),
+            10,
+        )
+
     except Exception as e:
         if ex.id not in _book_warned:
             _book_warned.add(ex.id)
-            log.warning("%s: стакан %s не получен: %s", ex.id, symbol, str(e)[:200])
+
+            log.warning(
+                "%s: стакан %s не получен: %s",
+                ex.id,
+                symbol,
+                str(e)[:200],
+            )
+
         return None
 
 
 async def refresh_books(by_id, keys, cache):
-    """keys: [(ex_id, symbol)]. Кладёт свежие стаканы в cache[(ex_id, symbol)] = (время, стакан|None)."""
-    books = await asyncio.gather(*[fetch_book(by_id[e], s) for e, s in keys])
+    books = await asyncio.gather(
+        *[
+            fetch_book(by_id[e], s)
+            for e, s in keys
+        ]
+    )
+
     now = time.time()
+
     for k, b in zip(keys, books):
         cache[k] = (now, b)
 
 
-# ---------- Статус ввода/вывода ----------
+# ============================================================
+# СТАТУСЫ ВВОДА И ВЫВОДА
+# ============================================================
+
 _cur_warned = set()
 
 
-async def load_currencies(ex):
-    try:
-        data = await asyncio.wait_for(ex.fetch_currencies(), 60)
-        return (data or None), None
-    except Exception as e:
-        return None, str(e)[:200]
+def parse_bool(value):
+    """
+    Безопасно разбирает булевы значения из API.
 
+    Важно:
+        "false" -> False
+        "true"  -> True
+        None    -> None
 
-async def currency_loop(app: Application):
-    """Фоново обновляет статусы ввода/вывода монет для включённых бирж."""
-    exchanges = app.bot_data["exchanges"]
-    store = app.bot_data["currencies"]  # {ex_id: {"time": ts, "cur": {код: валюта} | None}}
-    while True:
-        try:
-            wanted = set()
-            for c in app.bot_data["cfg"].get("chats", {}).values():
-                wanted |= set(EXCHANGES) - set(c.get("disabled", []))
-            now = time.time()
-            due = [
-                e for e in exchanges
-                if e.id in wanted and now - store.get(e.id, {}).get("time", 0) > CURRENCY_TTL
-            ]
-            if due:
-                results = await asyncio.gather(*[load_currencies(e) for e in due])
-                for ex, (data, err) in zip(due, results):
-                    if data:
-                        store[ex.id] = {"time": time.time(), "cur": data}
-                        log.info("%s: статусы ввода/вывода получены для %d монет", ex.id, len(data))
-                    else:
-                        prev = store.get(ex.id, {}).get("cur")
-                        store[ex.id] = {"time": time.time() - CURRENCY_TTL + CURRENCY_RETRY, "cur": prev}
-                        if ex.id not in _cur_warned:
-                            _cur_warned.add(ex.id)
-                            log.info(
-                                "%s: статусов ввода/вывода нет (обычно нужны API-ключи только на чтение). %s",
-                                ex.id, err or "",
-                            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("Ошибка в обновлении статусов монет")
-        await asyncio.sleep(30)
+    Неизвестные значения не превращаются в True или False.
+    """
 
+    if value is True or value == 1:
+        return True
 
-def _norm(name):
-    return re.sub(r"[^A-Z0-9]", "", str(name).upper())
-
-
-def transfer_status(currencies, buy_ex, sell_ex, base):
-    """True - можно вывести с биржи покупки и ввести на бирже продажи (есть общая сеть),
-    False - нельзя, None - неизвестно."""
-    cb = (currencies.get(buy_ex) or {}).get("cur")
-    cs = (currencies.get(sell_ex) or {}).get("cur")
-    if not cb or not cs:
-        return None
-    b, s = cb.get(base), cs.get(base)
-    if not b or not s:
-        return None
-
-    can_withdraw, can_deposit = b.get("withdraw"), s.get("deposit")
-    if can_withdraw is False or can_deposit is False:
+    if value is False or value == 0:
         return False
 
-    nets_b, nets_s = b.get("networks") or {}, s.get("networks") or {}
-    if nets_b and nets_s:
-        out_b = {_norm(k) for k, v in nets_b.items() if (v or {}).get("withdraw") is not False}
-        in_s = {_norm(k) for k, v in nets_s.items() if (v or {}).get("deposit") is not False}
-        return bool(out_b & in_s)
-    if can_withdraw is True and can_deposit is True:
-        return True
+    if isinstance(value, str):
+        value = value.strip().lower()
+
+        if value in (
+            "true",
+            "1",
+            "yes",
+            "enabled",
+            "enable",
+        ):
+            return True
+
+        if value in (
+            "false",
+            "0",
+            "no",
+            "disabled",
+            "disable",
+        ):
+            return False
+
     return None
 
 
-# ---------- Форматирование ----------
+def parse_weex_coins(items):
+    """
+    Ответ публичного GET /api/v3/coins у WEEX.
+    """
+
+    out = {}
+
+    for c in items or []:
+        code = str(
+            c.get("coin", "")
+        ).upper().strip()
+
+        if not code:
+            continue
+
+        nets = {}
+
+        for n in c.get("networkList") or []:
+            name = (
+                n.get("network")
+                or n.get("name")
+                or n.get("chain")
+            )
+
+            if not name:
+                continue
+
+            nets[str(name)] = {
+                "withdraw": parse_bool(
+                    n.get("withdrawEnable")
+                ),
+                "deposit": parse_bool(
+                    n.get("depositEnable")
+                ),
+                "contract": (
+                    n.get("contract")
+                    or n.get("contractAddress")
+                    or n.get("contract_address")
+                ),
+            }
+
+        out[code] = {
+            "withdraw": parse_bool(
+                c.get("withdrawAllEnable")
+            ),
+            "deposit": parse_bool(
+                c.get("depositAllEnable")
+            ),
+            "networks": nets,
+        }
+
+    return out
+
+
+async def weex_currencies(ex):
+    """
+    У WEEX статусы монет запрашиваются через публичный endpoint.
+    """
+
+    url = "https://api-spot.weex.com/api/v3/coins"
+
+    timeout = aiohttp.ClientTimeout(total=30)
+
+    async with aiohttp.ClientSession(
+        trust_env=True,
+        timeout=timeout,
+    ) as session:
+
+        async with session.get(url) as r:
+            r.raise_for_status()
+            resp = await r.json(content_type=None)
+
+    items = (
+        resp.get("data", resp)
+        if isinstance(resp, dict)
+        else resp
+    )
+
+    return parse_weex_coins(items)
+
+
+CURRENCY_OVERRIDE = {
+    "weex": weex_currencies,
+}
+
+
+async def load_currencies(ex):
+    """
+    Сначала использует специальный загрузчик, если он есть.
+    Затем пробует стандартный CCXT.
+    """
+
+    loaders = []
+
+    if ex.id in CURRENCY_OVERRIDE:
+        loaders.append(
+            lambda: CURRENCY_OVERRIDE[ex.id](ex)
+        )
+
+    loaders.append(
+        lambda: ex.fetch_currencies()
+    )
+
+    errors = []
+
+    for load in loaders:
+        try:
+            data = await asyncio.wait_for(
+                load(),
+                60,
+            )
+
+            if data:
+                return data, None
+
+        except Exception as e:
+            errors.append(str(e)[:150])
+
+    return None, "; ".join(errors)
+
+
+# ============================================================
+# СОПОСТАВЛЕНИЕ СЕТЕЙ
+# ============================================================
+
+# Важно: здесь используются полные названия сетей.
+# Нельзя разбивать название на отдельные слова и искать пересечение:
+# например, ARBITRUM NOVA и ARBITRUM ONE — разные сети.
+
+NET_ALIASES = {
+    "BSC": "BEP20",
+    "BNB": "BEP20",
+    "BNBSMARTCHAIN": "BEP20",
+    "BEP20": "BEP20",
+    "BEP20BSC": "BEP20",
+
+    "ETH": "ERC20",
+    "ETHEREUM": "ERC20",
+    "ERC20": "ERC20",
+
+    "TRX": "TRC20",
+    "TRON": "TRC20",
+    "TRC20": "TRC20",
+
+    "SOL": "SOLANA",
+    "SOLANA": "SOLANA",
+
+    "ARB": "ARBITRUM_ONE",
+    "ARBITRUM": "ARBITRUM_ONE",
+    "ARBITRUMONE": "ARBITRUM_ONE",
+    "ARBITRUMONECHAIN": "ARBITRUM_ONE",
+
+    "ARBITRUMNOVA": "ARBITRUM_NOVA",
+
+    "OP": "OPTIMISM",
+    "OPTIMISM": "OPTIMISM",
+
+    "MATIC": "POLYGON",
+    "POL": "POLYGON",
+    "POLYGON": "POLYGON",
+
+    "AVAX": "AVALANCHE_C",
+    "AVAXC": "AVALANCHE_C",
+    "CCHAIN": "AVALANCHE_C",
+    "AVALANCHEC": "AVALANCHE_C",
+
+    "BASE": "BASE",
+
+    "ZKSYNC": "ZKSYNC",
+    "ZKSYNCERA": "ZKSYNC_ERA",
+}
+
+
+def canonical_network(name):
+    """
+    Возвращает каноническое имя сети.
+
+    Неизвестные сети остаются отдельными идентификаторами.
+    """
+
+    raw = str(name or "").strip().upper()
+
+    compact = re.sub(
+        r"[^A-Z0-9]",
+        "",
+        raw,
+    )
+
+    if not compact:
+        return None
+
+    return NET_ALIASES.get(
+        compact,
+        re.sub(
+            r"[^A-Z0-9]+",
+            "_",
+            raw,
+        ).strip("_"),
+    )
+
+
+# ============================================================
+# ИЗВЛЕЧЕНИЕ АДРЕСОВ КОНТРАКТОВ
+# ============================================================
+
+def contract_from(obj):
+    """
+    Извлекает адрес контракта из явно известных полей.
+
+    Не пытается угадывать адрес по произвольным полям API.
+    """
+
+    if not isinstance(obj, dict):
+        return None
+
+    keys = (
+        "contract",
+        "contractAddress",
+        "contract_address",
+        "tokenAddress",
+        "token_address",
+        "contractAddr",
+    )
+
+    for key in keys:
+        value = obj.get(key)
+
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+
+    info = obj.get("info")
+
+    if isinstance(info, dict):
+        for key in keys:
+            value = info.get(key)
+
+            if isinstance(value, str) and value.strip():
+                return value.strip().lower()
+
+    return None
+
+
+def network_name(key, network):
+    if isinstance(network, dict):
+        return (
+            network.get("network")
+            or network.get("name")
+            or network.get("chain")
+            or network.get("id")
+            or network.get("code")
+            or key
+        )
+
+    return key
+
+
+def normalise_coin(coin):
+    """
+    Приводит структуру валюты CCXT к общему виду.
+    """
+
+    if not isinstance(coin, dict):
+        return {}
+
+    raw_nets = coin.get("networks") or {}
+
+    nets = {}
+
+    if isinstance(raw_nets, dict):
+        iterable = raw_nets.items()
+
+    elif isinstance(raw_nets, list):
+        iterable = [
+            (str(i), n)
+            for i, n in enumerate(raw_nets)
+        ]
+
+    else:
+        iterable = []
+
+    for key, n in iterable:
+        if not isinstance(n, dict):
+            continue
+
+        name = network_name(key, n)
+        canon = canonical_network(name)
+
+        if not canon:
+            continue
+
+        nets[canon] = {
+            "withdraw": parse_bool(
+                n.get("withdraw")
+            ),
+            "deposit": parse_bool(
+                n.get("deposit")
+            ),
+            "contract": contract_from(n),
+        }
+
+    return {
+        "withdraw": parse_bool(
+            coin.get("withdraw")
+        ),
+        "deposit": parse_bool(
+            coin.get("deposit")
+        ),
+        "networks": nets,
+    }
+
+
+def get_coin(cur, base):
+    """
+    Ищет валюту без учёта регистра тикера.
+    """
+
+    if not isinstance(cur, dict):
+        return None
+
+    coin = (
+        cur.get(base.upper())
+        or cur.get(base.lower())
+    )
+
+    if coin is None:
+        for code, value in cur.items():
+            if str(code).upper() == base.upper():
+                coin = value
+                break
+
+    if not coin:
+        return None
+
+    return normalise_coin(coin)
+
+
+# ============================================================
+# ПРОВЕРКА СТОРОНЫ ПЕРЕВОДА
+# ============================================================
+
+def side_info(currencies, ex_id, base, key):
+    """
+    key:
+        withdraw — вывод
+        deposit  — ввод
+
+    state:
+        open    — операция явно разрешена
+        closed  — операция явно запрещена
+        unknown — данных недостаточно
+    """
+
+    entry = currencies.get(ex_id) or {}
+
+    cur = entry.get("cur")
+
+    if not cur:
+        return {
+            "state": "unknown",
+            "nets": {},
+        }
+
+    # Не используем устаревшие данные.
+    if time.time() - entry.get("time", 0) > CURRENCY_TTL:
+        return {
+            "state": "unknown",
+            "nets": {},
+        }
+
+    coin = get_coin(cur, base)
+
+    if not coin:
+        return {
+            "state": "unknown",
+            "nets": {},
+        }
+
+    global_flag = coin.get(key)
+
+    # Глобальный запрет операции имеет приоритет.
+    if global_flag is False:
+        return {
+            "state": "closed",
+            "nets": {},
+        }
+
+    networks = coin.get("networks") or {}
+
+    if networks:
+        enabled = {}
+        unknown = False
+
+        for net, info in networks.items():
+            flag = info.get(key)
+
+            if flag is True:
+                enabled[net] = info
+
+            elif flag is None:
+                unknown = True
+
+        if enabled:
+            return {
+                "state": "open",
+                "nets": enabled,
+                "has_unknown": unknown,
+            }
+
+        if unknown:
+            return {
+                "state": "unknown",
+                "nets": {},
+            }
+
+        return {
+            "state": "closed",
+            "nets": {},
+        }
+
+    # Нет списка сетей, но глобальный флаг разрешает операцию.
+    # Этого недостаточно для строгого подтверждения перевода.
+    if global_flag is True:
+        return {
+            "state": "open",
+            "nets": None,
+        }
+
+    return {
+        "state": "unknown",
+        "nets": {},
+    }
+
+
+# ============================================================
+# ИТОГОВАЯ ПРОВЕРКА ПЕРЕВОДА
+# ============================================================
+
+def transfer_status(currencies, buy_ex, sell_ex, base):
+    """
+    True:
+        вывод и ввод разрешены,
+        общая сеть найдена,
+        адреса контрактов совпадают.
+
+    False:
+        одна из операций закрыта,
+        общей сети нет,
+        либо адреса контрактов различаются.
+
+    partial:
+        часть информации есть, но строгого подтверждения нет.
+
+    None:
+        данных нет вообще.
+    """
+
+    w = side_info(
+        currencies,
+        buy_ex,
+        base,
+        "withdraw",
+    )
+
+    d = side_info(
+        currencies,
+        sell_ex,
+        base,
+        "deposit",
+    )
+
+    # Если хотя бы одна операция точно закрыта — перевод невозможен.
+    if (
+        w["state"] == "closed"
+        or d["state"] == "closed"
+    ):
+        return False
+
+    # Нет данных по обеим сторонам.
+    if (
+        w["state"] == "unknown"
+        and d["state"] == "unknown"
+    ):
+        return None
+
+    # Данные есть только по одной стороне.
+    if (
+        w["state"] == "unknown"
+        or d["state"] == "unknown"
+    ):
+        return "partial"
+
+    # Обе стороны разрешены, но сеть не раскрыта.
+    if (
+        w["nets"] is None
+        or d["nets"] is None
+    ):
+        return "partial"
+
+    common = set(w["nets"]) & set(d["nets"])
+
+    if not common:
+        # Если есть сети с неизвестным статусом,
+        # отсутствие известного пересечения не доказывает невозможность.
+        if (
+            w.get("has_unknown")
+            or d.get("has_unknown")
+        ):
+            return "partial"
+
+        return False
+
+    missing_contract = False
+
+    for network in common:
+        withdraw_contract = (
+            w["nets"][network].get("contract")
+        )
+
+        deposit_contract = (
+            d["nets"][network].get("contract")
+        )
+
+        # Оба адреса доступны — сравниваем.
+        if withdraw_contract and deposit_contract:
+            if withdraw_contract == deposit_contract:
+                return True
+
+            # Контракты на одной сети различаются.
+            continue
+
+        # Если хотя бы один адрес не предоставлен,
+        # нельзя строго подтвердить идентичность токена.
+        missing_contract = True
+
+    if missing_contract:
+        return "partial"
+
+    # Общая сеть есть, но все доступные адреса контрактов различаются.
+    return False
+
+
+# ============================================================
+# ФОНОВОЕ ОБНОВЛЕНИЕ СТАТУСОВ ВАЛЮТ
+# ============================================================
+
+async def currency_loop(app: Application):
+    """
+    Обновляет статусы ввода/вывода.
+
+    Если запрос не удался, старые данные сбрасываются,
+    чтобы бот не использовал устаревший статус как актуальный.
+    """
+
+    exchanges = app.bot_data["exchanges"]
+    store = app.bot_data["currencies"]
+
+    while True:
+        try:
+            wanted = set()
+
+            for c in app.bot_data["cfg"].get(
+                "chats",
+                {},
+            ).values():
+
+                wanted |= (
+                    set(EXCHANGES)
+                    - set(c.get("disabled", []))
+                )
+
+            now = time.time()
+
+            due = [
+                e
+                for e in exchanges
+                if (
+                    e.id in wanted
+                    and now - store.get(e.id, {}).get("time", 0)
+                    > CURRENCY_TTL
+                )
+            ]
+
+            if due:
+                results = await asyncio.gather(
+                    *[
+                        load_currencies(e)
+                        for e in due
+                    ]
+                )
+
+                for ex, (data, err) in zip(due, results):
+                    if data:
+                        store[ex.id] = {
+                            "time": time.time(),
+                            "cur": data,
+                            "error": None,
+                        }
+
+                        log.info(
+                            "%s: статусы ввода/вывода получены для %d монет",
+                            ex.id,
+                            len(data),
+                        )
+
+                        _cur_warned.discard(ex.id)
+
+                    else:
+                        # Старые данные не сохраняем.
+                        # Повторная попытка будет через CURRENCY_RETRY.
+                        store[ex.id] = {
+                            "time": (
+                                time.time()
+                                - CURRENCY_TTL
+                                + CURRENCY_RETRY
+                            ),
+                            "cur": None,
+                            "error": err,
+                        }
+
+                        if ex.id not in _cur_warned:
+                            _cur_warned.add(ex.id)
+
+                            log.info(
+                                "%s: статусы недоступны "
+                                "(часто нужны API-ключи только на чтение). %s",
+                                ex.id,
+                                err or "",
+                            )
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception:
+            log.exception(
+                "Ошибка в обновлении статусов монет"
+            )
+
+        await asyncio.sleep(30)
+
+
+# ============================================================
+# ФОРМАТИРОВАНИЕ СООБЩЕНИЙ
+# ============================================================
+
 def trunc1(x):
-    """Округление вниз до 0.1 (как в образце: 6.66% -> 6.6%)."""
     return math.floor(x * 10 + 1e-9) / 10
 
 
 def fmt_vol(v):
-    return f"{v / 1e6:.1f}M" if v >= 1e6 else f"{v / 1e3:.0f}K"
+    if v >= 1e6:
+        return f"{v / 1e6:.1f}M"
+
+    return f"{v / 1e3:.0f}K"
 
 
 def fmt_k(x):
     if x >= 1e6:
         return f"{x / 1e6:.2f}M"
+
     if x >= 1e3:
         return f"{x / 1e3:.2f}K"
+
     return f"{x:.2f}"
 
 
 def fmt_price(p):
     s = f"{p:.10f}".rstrip("0").rstrip(".")
+
     return s or "0"
 
 
 def short_price(p):
-    """Цена с двумя значащими цифрами: 0.21344 -> 0.21, 0.00123 -> 0.0012."""
     if p <= 0:
         return "0"
-    decimals = max(2, -math.floor(math.log10(p)) + 1)
+
+    decimals = max(
+        2,
+        -math.floor(math.log10(p)) + 1,
+    )
+
     return f"{p:.{decimals}f}"
 
 
 def qty_str(q):
-    return f"{q:,.0f}".replace(",", " ") if q >= 100 else f"{q:.4g}"
+    if q >= 100:
+        return f"{q:,.0f}".replace(",", " ")
+
+    return f"{q:.4g}"
 
 
 def pair_url(ex_id, symbol):
     base, quote = symbol.split("/")
+
     return PAIR_URLS[ex_id].format(
-        base=base, quote=quote, base_l=base.lower(), quote_l=quote.lower()
+        base=base,
+        quote=quote,
+        base_l=base.lower(),
+        quote_l=quote.lower(),
     )
 
 
 def ex_link(ex_id, symbol):
-    return f'<a href="{pair_url(ex_id, symbol)}">{EX_NAMES.get(ex_id, ex_id)}</a>'
+    return (
+        f'<a href="{pair_url(ex_id, symbol)}">'
+        f'{EX_NAMES.get(ex_id, ex_id)}</a>'
+    )
 
 
 def price_range(first, second):
-    a, b = fmt_price(first), fmt_price(second)
+    a = fmt_price(first)
+    b = fmt_price(second)
+
     return a if a == b else f"[{a}:{b}]"
 
 
 def status_emoji(status):
-    return {True: "🟢", False: "🔴"}.get(status, "⚪")
+    return {
+        True: "🟢",
+        False: "🔴",
+        "partial": "🟡",
+    }.get(status, "⚪")
 
 
 def fmt_anomaly(a):
     orders = a["orders"]
+
     base = a["symbol"].split("/")[0]
-    margins = [o["margin"] for o in orders]
-    lo, hi = trunc1(min(margins)), trunc1(max(margins))
 
-    header = f"<b>{a['symbol']} [+{lo:.1f}%:+{hi:.1f}%]</b> {status_emoji(a['transfer'])}"
+    margins = [
+        o["margin"]
+        for o in orders
+    ]
 
-    body = [f" • <b>Выгодных ордеров:</b> {len(orders)}"]
-    for n, o in enumerate(orders[:MAX_ORDER_LINES], 1):
+    lo = trunc1(min(margins))
+    hi = trunc1(max(margins))
+
+    header = (
+        f"<b>{a['symbol']} "
+        f"[+{lo:.1f}%:+{hi:.1f}%]</b> "
+        f"{status_emoji(a['transfer'])}"
+    )
+
+    body = [
+        f" • <b>Выгодных ордеров:</b> {len(orders)}"
+    ]
+
+    for n, o in enumerate(
+        orders[:MAX_ORDER_LINES],
+        1,
+    ):
         amount = o["qty"] * o["price"]
-        body.append(
-            f"{n})+{trunc1(o['margin']):.1f}%: {fmt_price(o['price'])}: "
-            f"[${short_price(o['price'])}:${fmt_k(amount)}]: {qty_str(o['qty'])} {base}"
-        )
-    if len(orders) > MAX_ORDER_LINES:
-        body.append(f"…и ещё {len(orders) - MAX_ORDER_LINES}")
-    body.append(
-        f" • <b>Купля:</b> {ex_link(a['buy_ex'], a['symbol'])} "
-        f"{price_range(a['buy_lo'], a['buy_hi'])} (24vol ${fmt_vol(a['vol_buy'])})"
-    )
-    body.append(
-        f" • <b>Продажа:</b> {ex_link(a['sell_ex'], a['symbol'])} "
-        f"{price_range(a['sell_hi'], a['sell_lo'])} (24vol ${fmt_vol(a['vol_sell'])})"
-    )
-    body.append(f" • <b>Доступ к выводу:</b> {status_emoji(a['transfer'])}")
 
-    return header + "\n<blockquote>" + "\n".join(body) + "</blockquote>"
+        body.append(
+            f"{n})+{trunc1(o['margin']):.1f}%: "
+            f"{fmt_price(o['price'])}: "
+            f"[${short_price(o['price'])}:${fmt_k(amount)}]: "
+            f"{qty_str(o['qty'])} {base}"
+        )
+
+    if len(orders) > MAX_ORDER_LINES:
+        body.append(
+            f"…и ещё {len(orders) - MAX_ORDER_LINES}"
+        )
+
+    body.append(
+        f" • <b>Купля:</b> "
+        f"{ex_link(a['buy_ex'], a['symbol'])} "
+        f"{price_range(a['buy_lo'], a['buy_hi'])} "
+        f"(24vol ${fmt_vol(a['vol_buy'])})"
+    )
+
+    body.append(
+        f" • <b>Продажа:</b> "
+        f"{ex_link(a['sell_ex'], a['symbol'])} "
+        f"{price_range(a['sell_hi'], a['sell_lo'])} "
+        f"(24vol ${fmt_vol(a['vol_sell'])})"
+    )
+
+    body.append(
+        f" • <b>Доступ к выводу:</b> "
+        f"{status_emoji(a['transfer'])}"
+    )
+
+    if a["transfer"] == "partial":
+        body.append(
+            " • <i>Перевод не подтверждён: "
+            "проверьте сеть и контракт вручную.</i>"
+        )
+
+    return (
+        header
+        + "\n<blockquote>"
+        + "\n".join(body)
+        + "</blockquote>"
+    )
 
 
 def chunk_blocks(items):
-    """items: [(key, text)] -> группы так, чтобы каждое сообщение влезало в лимит Telegram."""
-    chunks, cur, size = [], [], 0
+    """
+    Группирует сообщения, чтобы не превышать лимит Telegram.
+    """
+
+    chunks = []
+    cur = []
+    size = 0
+
     for key, text in items:
-        if cur and size + len(text) + 2 > MAX_MESSAGE_CHARS:
+        if (
+            cur
+            and size + len(text) + 2 > MAX_MESSAGE_CHARS
+        ):
             chunks.append(cur)
-            cur, size = [], 0
+            cur = []
+            size = 0
+
         cur.append((key, text))
         size += len(text) + 2
+
     if cur:
         chunks.append(cur)
+
     return chunks
 
 
-# ---------- Цикл сканирования ----------
+# ============================================================
+# ОСНОВНОЙ ЦИКЛ СКАНИРОВАНИЯ
+# ============================================================
+
 async def scanner_loop(app: Application):
     exchanges = app.bot_data["exchanges"]
-    by_id = {e.id: e for e in exchanges}
+
+    by_id = {
+        e.id: e
+        for e in exchanges
+    }
+
     cfg = app.bot_data["cfg"]
     currencies = app.bot_data["currencies"]
+
     down = set()
     sent = {}
     counted = set()
     book_cache = {}
 
     def fresh(entry, now):
-        return bool(entry) and now - entry[0] <= DEPTH_TTL
+        return (
+            bool(entry)
+            and now - entry[0] <= DEPTH_TTL
+        )
 
     while True:
         try:
             chats = cfg.get("chats", {})
-            if chats:
-                # опрашиваем только те биржи, которые включены хотя бы в одной группе
-                wanted = set()
-                for c in chats.values():
-                    wanted |= set(EXCHANGES) - set(c.get("disabled", []))
-                to_fetch = [e for e in exchanges if e.id in wanted]
 
-                results = await asyncio.gather(*[fetch_exchange(e) for e in to_fetch])
+            if chats:
+                wanted = set()
+
+                for c in chats.values():
+                    wanted |= (
+                        set(EXCHANGES)
+                        - set(c.get("disabled", []))
+                    )
+
+                to_fetch = [
+                    e
+                    for e in exchanges
+                    if e.id in wanted
+                ]
+
+                results = await asyncio.gather(
+                    *[
+                        fetch_exchange(e)
+                        for e in to_fetch
+                    ]
+                )
+
                 data = {}
+
                 for ex_id, tick, err, stats in results:
                     if tick is None:
                         if ex_id not in down:
-                            log.warning("%s недоступна: %s", ex_id, err)
+                            log.warning(
+                                "%s недоступна: %s",
+                                ex_id,
+                                err,
+                            )
+
                             down.add(ex_id)
+
                     else:
                         if ex_id in down:
-                            log.info("%s снова доступна", ex_id)
+                            log.info(
+                                "%s снова доступна",
+                                ex_id,
+                            )
+
                             down.discard(ex_id)
+
                         data[ex_id] = tick
+
                         if ex_id not in counted:
                             counted.add(ex_id)
-                            log.info("%s: %d пар в сканировании (%s)",
-                                     ex_id, len(tick), describe(stats))
+
+                            log.info(
+                                "%s: %d пар в сканировании (%s)",
+                                ex_id,
+                                len(tick),
+                                describe(stats),
+                            )
+
                 app.bot_data["down"] = set(down)
 
-                # 1. кандидаты по каждой группе (по ценам из тикеров)
+                # 1. Поиск кандидатов по ценам.
+
                 now = time.time()
+
                 chat_cands = {}
                 cand_all = {}
+
                 for chat_id, c in list(chats.items()):
-                    off = set(c.get("disabled", []))
-                    chat_data = {k: v for k, v in data.items() if k not in off}
+                    off = set(
+                        c.get("disabled", [])
+                    )
+
+                    chat_data = {
+                        k: v
+                        for k, v in data.items()
+                        if k not in off
+                    }
+
                     if len(chat_data) < 2:
                         continue
+
                     lst = []
-                    for a in find_anomalies(chat_data, c["threshold"]):
-                        ckey = (a["symbol"], a["buy_ex"], a["sell_ex"])
-                        if now - sent.get((chat_id,) + ckey, 0) < COOLDOWN:
+
+                    threshold = c.get(
+                        "threshold",
+                        DEFAULT_THRESHOLD,
+                    )
+
+                    for a in find_anomalies(
+                        chat_data,
+                        threshold,
+                    ):
+                        ckey = (
+                            a["symbol"],
+                            a["buy_ex"],
+                            a["sell_ex"],
+                        )
+
+                        if (
+                            now - sent.get(
+                                (chat_id,) + ckey,
+                                0,
+                            ) < COOLDOWN
+                        ):
                             continue
+
                         lst.append((ckey, a))
-                        cand_all[ckey] = max(cand_all.get(ckey, 0), a["pct"])
+
+                        cand_all[ckey] = max(
+                            cand_all.get(ckey, 0),
+                            a["pct"],
+                        )
+
                     if lst:
                         chat_cands[chat_id] = (c, lst)
 
-                # 2. загружаем стаканы у самых выгодных кандидатов (свежие берём из кэша)
-                need_books, checked = [], 0
-                for ckey, _pct in sorted(cand_all.items(), key=lambda kv: kv[1], reverse=True):
+                # 2. Получение стаканов.
+
+                need_books = []
+                checked = 0
+
+                for ckey, _pct in sorted(
+                    cand_all.items(),
+                    key=lambda kv: kv[1],
+                    reverse=True,
+                ):
                     sym, buy_ex, sell_ex = ckey
-                    missing = [(e, sym) for e in (buy_ex, sell_ex)
-                               if not fresh(book_cache.get((e, sym)), now)]
+
+                    missing = [
+                        (e, sym)
+                        for e in (buy_ex, sell_ex)
+                        if not fresh(
+                            book_cache.get((e, sym)),
+                            now,
+                        )
+                    ]
+
                     if not missing:
                         continue
+
                     checked += 1
+
                     if checked > MAX_BOOK_CHECKS:
                         break
+
                     for k in missing:
                         if k not in need_books:
                             need_books.append(k)
-                if need_books:
-                    await refresh_books(by_id, need_books, book_cache)
 
-                # 3. считаем ордера по порогу каждой группы и отправляем, если объём достаточный
+                if need_books:
+                    await refresh_books(
+                        by_id,
+                        need_books,
+                        book_cache,
+                    )
+
+                # 3. Проверка стаканов и отправка.
+
                 now = time.time()
+
                 for chat_id, (c, lst) in chat_cands.items():
-                    thr = c["threshold"]
-                    min_usd = c.get("min_trade_usdt", MIN_TRADE_USDT)
+                    thr = c.get(
+                        "threshold",
+                        DEFAULT_THRESHOLD,
+                    )
+
+                    min_usd = c.get(
+                        "min_trade_usdt",
+                        MIN_TRADE_USDT,
+                    )
+
                     accepted = []
+
                     for ckey, a in lst:
                         sym, buy_ex, sell_ex = ckey
-                        bb, sb = book_cache.get((buy_ex, sym)), book_cache.get((sell_ex, sym))
-                        if not bb or not sb or not bb[1] or not sb[1]:
-                            continue
-                        if now - bb[0] > DEPTH_MAX_AGE or now - sb[0] > DEPTH_MAX_AGE:
-                            continue
-                        info = depth_orders(bb[1]["asks"], sb[1]["bids"], thr)
-                        if info is None or info["usdt"] < min_usd:
-                            continue
-                        info["transfer"] = transfer_status(
-                            currencies, buy_ex, sell_ex, sym.split("/")[0]
+
+                        bb = book_cache.get(
+                            (buy_ex, sym)
                         )
-                        accepted.append(((chat_id,) + ckey, {**a, **info}))
+
+                        sb = book_cache.get(
+                            (sell_ex, sym)
+                        )
+
+                        if (
+                            not bb
+                            or not sb
+                            or not bb[1]
+                            or not sb[1]
+                        ):
+                            continue
+
+                        if (
+                            now - bb[0] > DEPTH_MAX_AGE
+                            or now - sb[0] > DEPTH_MAX_AGE
+                        ):
+                            continue
+
+                        info = depth_orders(
+                            bb[1].get("asks", []),
+                            sb[1].get("bids", []),
+                            thr,
+                        )
+
+                        if (
+                            info is None
+                            or info["usdt"] < min_usd
+                        ):
+                            continue
+
+                        info["transfer"] = transfer_status(
+                            currencies,
+                            buy_ex,
+                            sell_ex,
+                            sym.split("/")[0],
+                        )
+
+                        accepted.append(
+                            (
+                                (chat_id,) + ckey,
+                                {
+                                    **a,
+                                    **info,
+                                },
+                            )
+                        )
+
                     if not accepted:
                         continue
 
                     shown = accepted[:MAX_PER_MESSAGE]
-                    chunks = chunk_blocks([(key, fmt_anomaly(a)) for key, a in shown])
+
+                    chunks = chunk_blocks(
+                        [
+                            (key, fmt_anomaly(a))
+                            for key, a in shown
+                        ]
+                    )
+
                     for n, chunk in enumerate(chunks):
-                        text = "\n\n".join(t for _, t in chunk)
-                        if n == len(chunks) - 1 and len(accepted) > len(shown):
-                            text += f"\n\n…и ещё {len(accepted) - len(shown)}"
+                        text = "\n\n".join(
+                            t
+                            for _, t in chunk
+                        )
+
+                        if (
+                            n == len(chunks) - 1
+                            and len(accepted) > len(shown)
+                        ):
+                            text += (
+                                f"\n\n…и ещё "
+                                f"{len(accepted) - len(shown)}"
+                            )
+
                         try:
                             await app.bot.send_message(
-                                int(chat_id), text, parse_mode=ParseMode.HTML, **SEND_KW
+                                int(chat_id),
+                                text,
+                                parse_mode=ParseMode.HTML,
+                                **SEND_KW,
                             )
+
                             for key, _ in chunk:
                                 sent[key] = now
+
                         except Exception as e:
-                            log.warning("Не удалось отправить в %s: %s", chat_id, e)
+                            log.warning(
+                                "Не удалось отправить в %s: %s",
+                                chat_id,
+                                e,
+                            )
+
                             break
+
+                # Очистка старых записей.
 
                 if len(sent) > 5000:
                     cutoff = time.time() - COOLDOWN
-                    sent = {k: v for k, v in sent.items() if v > cutoff}
+
+                    sent = {
+                        k: v
+                        for k, v in sent.items()
+                        if v > cutoff
+                    }
+
                 if len(book_cache) > 3000:
                     cutoff = time.time() - DEPTH_MAX_AGE
-                    book_cache = {k: v for k, v in book_cache.items() if v[0] > cutoff}
+
+                    book_cache = {
+                        k: v
+                        for k, v in book_cache.items()
+                        if v[0] > cutoff
+                    }
+
         except asyncio.CancelledError:
             raise
+
         except Exception:
-            log.exception("Ошибка в цикле сканирования")
+            log.exception(
+                "Ошибка в цикле сканирования"
+            )
+
         await asyncio.sleep(SCAN_INTERVAL)
 
 
-# ---------- Обработчики Telegram ----------
+# ============================================================
+# TELEGRAM: ОБРАБОТЧИКИ
+# ============================================================
+
 def normalize(text):
     t = text.lower().replace("ё", "е")
-    t = re.sub(r"[^\w\s]", " ", t)
+
+    t = re.sub(
+        r"[^\w\s]",
+        " ",
+        t,
+    )
+
     return " ".join(t.split())
 
 
 def get_chat(context, update):
-    """Настройки текущего чата или None, если чат не подключён."""
     cfg = context.application.bot_data["cfg"]
-    return cfg.setdefault("chats", {}).get(str(update.effective_chat.id))
+
+    return cfg.setdefault(
+        "chats",
+        {},
+    ).get(
+        str(update.effective_chat.id)
+    )
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
+
     if not msg or not msg.text:
         return
+
     t = normalize(msg.text)
+
     if "трекер" in t and "ты тут" in t:
         cfg = context.application.bot_data["cfg"]
-        chat_id = str(update.effective_chat.id)
-        chats = cfg.setdefault("chats", {})
+
+        chat_id = str(
+            update.effective_chat.id
+        )
+
+        chats = cfg.setdefault(
+            "chats",
+            {},
+        )
+
         new = chat_id not in chats
+
         chats.setdefault(
             chat_id,
-            {"threshold": DEFAULT_THRESHOLD, "disabled": [], "min_trade_usdt": MIN_TRADE_USDT},
+            {
+                "threshold": DEFAULT_THRESHOLD,
+                "disabled": [],
+                "min_trade_usdt": MIN_TRADE_USDT,
+            },
         )
+
         save_config(cfg)
+
         c = chats[chat_id]
+
         await msg.reply_text(
-            ("Да, тут! Подключился к этой группе. " if new else "Да, тут! ")
+            (
+                "Да, тут! Подключился к этой группе. "
+                if new
+                else "Да, тут! "
+            )
             + f"Присылаю разницу цен от {c['threshold']}% между биржами, "
-            f"если по стаканам можно провернуть от ${c.get('min_trade_usdt', MIN_TRADE_USDT):g}.\n"
-            "Порог: /search 0.5%\n"
-            "Минимальный объём: /minsize 100\n"
-            "Биржи: /disable binance bybit, /enable binance bybit\n"
-            "Настройки: /status"
+            + f"если по стаканам можно провернуть от "
+            + f"${c.get('min_trade_usdt', MIN_TRADE_USDT):g}.\n"
+            + "Порог: /search 0.5%\n"
+            + "Минимальный объём: /minsize 100\n"
+            + "Биржи: /disable binance bybit, /enable binance bybit\n"
+            + "Настройки: /status"
         )
 
 
-async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def search_cmd(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     msg = update.effective_message
+
     cfg = context.application.bot_data["cfg"]
     chat = get_chat(context, update)
 
     if chat is None:
-        await msg.reply_text("Сначала напишите в чате: «трекер, ты тут?»")
+        await msg.reply_text(
+            "Сначала напишите в чате: «трекер, ты тут?»"
+        )
         return
+
     if not context.args:
-        await msg.reply_text("Формат: /search 0.5%")
+        await msg.reply_text(
+            "Формат: /search 0.5%"
+        )
         return
+
     try:
-        value = float(context.args[0].replace("%", "").replace(",", "."))
+        value = float(
+            context.args[0]
+            .replace("%", "")
+            .replace(",", ".")
+        )
+
     except ValueError:
-        await msg.reply_text("Не понял число. Пример: /search 0.5%")
+        await msg.reply_text(
+            "Не понял число. Пример: /search 0.5%"
+        )
         return
+
     if not (0.05 <= value <= MAX_SPREAD_PCT):
-        await msg.reply_text(f"Порог должен быть от 0.05% до {MAX_SPREAD_PCT}%.")
+        await msg.reply_text(
+            f"Порог должен быть от 0.05% до {MAX_SPREAD_PCT}%."
+        )
         return
 
     chat["threshold"] = value
+
     save_config(cfg)
-    await msg.reply_text(f"Ищу разницу цен от {value}% между биржами.")
+
+    await msg.reply_text(
+        f"Ищу разницу цен от {value}% между биржами."
+    )
 
 
-async def minsize_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def minsize_cmd(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     msg = update.effective_message
+
     cfg = context.application.bot_data["cfg"]
     chat = get_chat(context, update)
 
     if chat is None:
-        await msg.reply_text("Сначала напишите в чате: «трекер, ты тут?»")
+        await msg.reply_text(
+            "Сначала напишите в чате: «трекер, ты тут?»"
+        )
         return
-    current = chat.get("min_trade_usdt", MIN_TRADE_USDT)
+
+    current = chat.get(
+        "min_trade_usdt",
+        MIN_TRADE_USDT,
+    )
+
     if not context.args:
         await msg.reply_text(
             f"Сейчас показываю сигналы, где можно провернуть от ${current:g}.\n"
             "Изменить: /minsize 200"
         )
         return
+
     try:
-        value = float(context.args[0].replace("$", "").replace(",", "."))
+        value = float(
+            context.args[0]
+            .replace("$", "")
+            .replace(",", ".")
+        )
+
     except ValueError:
-        await msg.reply_text("Не понял число. Пример: /minsize 100")
-        return
-    if not (1 <= value <= 1_000_000):
-        await msg.reply_text("Сумма должна быть от $1 до $1 000 000.")
-        return
-
-    chat["min_trade_usdt"] = value
-    save_config(cfg)
-    await msg.reply_text(f"Показываю только сигналы, где можно провернуть от ${value:g}.")
-
-
-def parse_names(args):
-    names = []
-    for raw in args:
-        for part in raw.replace(",", " ").split():
-            names.append(part.lower())
-    return names
-
-
-async def toggle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, enable: bool):
-    msg = update.effective_message
-    cfg = context.application.bot_data["cfg"]
-    chat = get_chat(context, update)
-    cmd = "/enable" if enable else "/disable"
-
-    if chat is None:
-        await msg.reply_text("Сначала напишите в чате: «трекер, ты тут?»")
-        return
-
-    names = parse_names(context.args)
-    if not names:
         await msg.reply_text(
-            f"Формат: {cmd} binance bybit\nБиржи: " + ", ".join(EXCHANGES)
-            + ("\nВключить все: /enable all" if enable else "")
+            "Не понял число. Пример: /minsize 100"
         )
         return
 
-    disabled = set(chat.get("disabled", []))
+    if not (1 <= value <= 1_000_000):
+        await msg.reply_text(
+            "Сумма должна быть от $1 до $1 000 000."
+        )
+        return
+
+    chat["min_trade_usdt"] = value
+
+    save_config(cfg)
+
+    await msg.reply_text(
+        f"Показываю только сигналы, где можно провернуть от ${value:g}."
+    )
+
+
+def parse_names(args):
+    return [
+        part.lower()
+        for raw in args
+        for part in raw.replace(",", " ").split()
+    ]
+
+
+async def toggle_cmd(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    enable: bool,
+):
+    msg = update.effective_message
+
+    cfg = context.application.bot_data["cfg"]
+    chat = get_chat(context, update)
+
+    cmd = "/enable" if enable else "/disable"
+
+    if chat is None:
+        await msg.reply_text(
+            "Сначала напишите в чате: «трекер, ты тут?»"
+        )
+        return
+
+    names = parse_names(context.args)
+
+    if not names:
+        await msg.reply_text(
+            f"Формат: {cmd} binance bybit\n"
+            + "Биржи: "
+            + ", ".join(EXCHANGES)
+            + (
+                "\nВключить все: /enable all"
+                if enable
+                else ""
+            )
+        )
+        return
+
+    disabled = set(
+        chat.get("disabled", [])
+    )
+
     unknown = []
+
     if enable and names == ["all"]:
         disabled.clear()
+
     else:
-        valid = [n for n in names if n in EXCHANGES]
-        unknown = [n for n in names if n not in EXCHANGES]
+        valid = [
+            n
+            for n in names
+            if n in EXCHANGES
+        ]
+
+        unknown = [
+            n
+            for n in names
+            if n not in EXCHANGES
+        ]
+
         if enable:
             disabled -= set(valid)
         else:
             disabled |= set(valid)
 
-    chat["disabled"] = [e for e in EXCHANGES if e in disabled]
+    chat["disabled"] = [
+        e
+        for e in EXCHANGES
+        if e in disabled
+    ]
+
     save_config(cfg)
 
-    enabled = [e for e in EXCHANGES if e not in disabled]
+    enabled = [
+        e
+        for e in EXCHANGES
+        if e not in disabled
+    ]
+
     lines = []
+
     if unknown:
-        lines.append("Не знаю такие биржи: " + ", ".join(unknown))
-    lines.append("Включены: " + (", ".join(enabled) or "нет"))
+        lines.append(
+            "Не знаю такие биржи: "
+            + ", ".join(unknown)
+        )
+
+    lines.append(
+        "Включены: "
+        + (", ".join(enabled) or "нет")
+    )
+
     if disabled:
-        lines.append("Выключены: " + ", ".join(e for e in EXCHANGES if e in disabled))
+        lines.append(
+            "Выключены: "
+            + ", ".join(
+                e
+                for e in EXCHANGES
+                if e in disabled
+            )
+        )
+
     if len(enabled) < 2:
-        lines.append("⚠️ Нужно минимум 2 включённые биржи, иначе сравнивать нечего.")
-    await msg.reply_text("\n".join(lines))
+        lines.append(
+            "⚠️ Нужно минимум 2 включённые биржи."
+        )
+
+    await msg.reply_text(
+        "\n".join(lines)
+    )
 
 
-async def enable_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await toggle_cmd(update, context, True)
+async def enable_cmd(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await toggle_cmd(
+        update,
+        context,
+        True,
+    )
 
 
-async def disable_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await toggle_cmd(update, context, False)
+async def disable_cmd(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await toggle_cmd(
+        update,
+        context,
+        False,
+    )
 
 
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def status_cmd(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     msg = update.effective_message
+
     chat = get_chat(context, update)
+
     if chat is None:
-        await msg.reply_text("Уведомления выключены. Включить: «трекер, ты тут?»")
+        await msg.reply_text(
+            "Уведомления выключены. Включить: «трекер, ты тут?»"
+        )
         return
 
     bd = context.application.bot_data
-    off = set(chat.get("disabled", []))
-    enabled = [e for e in EXCHANGES if e not in off]
+
+    off = set(
+        chat.get("disabled", [])
+    )
+
+    enabled = [
+        e
+        for e in EXCHANGES
+        if e not in off
+    ]
+
     lines = [
-        f"Уведомления включены, порог {chat['threshold']}%, "
-        f"мин. объём ${chat.get('min_trade_usdt', MIN_TRADE_USDT):g}",
+        (
+            f"Уведомления включены, "
+            f"порог {chat.get('threshold', DEFAULT_THRESHOLD)}%, "
+            f"мин. объём "
+            f"${chat.get('min_trade_usdt', MIN_TRADE_USDT):g}"
+        ),
         "Включены: " + (", ".join(enabled) or "нет"),
     ]
+
     if off:
-        lines.append("Выключены: " + ", ".join(e for e in EXCHANGES if e in off))
-    unavailable = [e for e in enabled if e in bd.get("down", set())]
+        lines.append(
+            "Выключены: "
+            + ", ".join(
+                e
+                for e in EXCHANGES
+                if e in off
+            )
+        )
+
+    unavailable = [
+        e
+        for e in enabled
+        if e in bd.get("down", set())
+    ]
+
     if unavailable:
-        lines.append("Не отвечают сейчас: " + ", ".join(unavailable))
+        lines.append(
+            "Не отвечают сейчас: "
+            + ", ".join(unavailable)
+        )
+
     missing = bd.get("missing", [])
+
     if missing:
         lines.append(
-            "Нет в установленной ccxt: " + ", ".join(missing) + " (pip install -U ccxt)"
+            "Нет в установленной ccxt: "
+            + ", ".join(missing)
+            + " (pip install -U ccxt)"
         )
 
     store = bd.get("currencies", {})
-    known = [e for e in enabled if (store.get(e) or {}).get("cur")]
-    unknown = [e for e in enabled if e not in known]
-    lines.append("Статус вывода известен: " + (", ".join(known) or "ни для одной биржи"))
+
+    known = []
+    unknown = []
+
+    for e in enabled:
+        entry = store.get(e) or {}
+
+        if (
+            entry.get("cur")
+            and time.time() - entry.get("time", 0) <= CURRENCY_TTL
+        ):
+            known.append(e)
+        else:
+            unknown.append(e)
+
+    lines.append(
+        "Данные о валютах получены: "
+        + (", ".join(known) or "ни для одной биржи")
+    )
+
     if unknown:
-        lines.append("Статус вывода неизвестен (⚪, нужны API-ключи на чтение): " + ", ".join(unknown))
-    await msg.reply_text("\n".join(lines))
-
-
-async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cfg = context.application.bot_data["cfg"]
-    chats = cfg.setdefault("chats", {})
-    if chats.pop(str(update.effective_chat.id), None) is not None:
-        save_config(cfg)
-        await update.effective_message.reply_text(
-            "Уведомления в этом чате выключены. Включить: «трекер, ты тут?»"
+        lines.append(
+            "Статус перевода может быть ⚪/🟡: "
+            + ", ".join(unknown)
         )
+
+    lines.append(
+        "🟢 выдаётся только при подтверждённой сети "
+        "и совпадении контрактов."
+    )
+
+    await msg.reply_text(
+        "\n".join(lines)
+    )
+
+
+async def stop_cmd(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    cfg = context.application.bot_data["cfg"]
+
+    chats = cfg.setdefault(
+        "chats",
+        {},
+    )
+
+    if chats.pop(
+        str(update.effective_chat.id),
+        None,
+    ) is not None:
+
+        save_config(cfg)
+
+        await update.effective_message.reply_text(
+            "Уведомления в этом чате выключены. "
+            "Включить: «трекер, ты тут?»"
+        )
+
     else:
-        await update.effective_message.reply_text("Уведомления и так выключены.")
+        await update.effective_message.reply_text(
+            "Уведомления и так выключены."
+        )
 
 
-# ---------- Запуск ----------
+# ============================================================
+# ЗАПУСК И ЗАВЕРШЕНИЕ
+# ============================================================
+
 async def post_init(app: Application):
     cfg = app.bot_data["cfg"]
-    exchanges, missing = [], []
+
+    exchanges = []
+    missing = []
+
     for name in EXCHANGES:
         cls = getattr(ccxt, name, None)
+
         if cls is None:
             missing.append(name)
             continue
-        exchanges.append(cls(exchange_params(cfg, name)))
+
+        exchanges.append(
+            cls(exchange_params(cfg, name))
+        )
+
     if missing:
         log.warning(
-            "В установленной ccxt нет бирж: %s. Обновите: pip install -U ccxt",
+            "В установленной ccxt нет бирж: %s. "
+            "Обновите ccxt: pip install -U ccxt",
             ", ".join(missing),
         )
-    keyed = [e.id for e in exchanges if getattr(e, "apiKey", None)]
-    log.info("API-ключи (чтение) заданы для: %s", ", ".join(keyed) or "нет ни для одной биржи")
+
+    keyed = [
+        e.id
+        for e in exchanges
+        if getattr(e, "apiKey", None)
+    ]
+
+    log.info(
+        "API-ключи (чтение) заданы для: %s",
+        ", ".join(keyed) or "нет ни для одной биржи",
+    )
 
     app.bot_data["exchanges"] = exchanges
     app.bot_data["missing"] = missing
     app.bot_data["down"] = set()
     app.bot_data["currencies"] = {}
+
     app.bot_data["tasks"] = [
-        asyncio.create_task(scanner_loop(app)),
-        asyncio.create_task(currency_loop(app)),
+        asyncio.create_task(
+            scanner_loop(app)
+        ),
+        asyncio.create_task(
+            currency_loop(app)
+        ),
     ]
-    log.info("Бот запущен. Биржи: %s", ", ".join(e.id for e in exchanges))
+
+    log.info(
+        "Бот запущен. Биржи: %s",
+        ", ".join(e.id for e in exchanges),
+    )
 
 
 async def post_shutdown(app: Application):
     for task in app.bot_data.get("tasks", []):
         task.cancel()
+
+    if app.bot_data.get("tasks"):
+        await asyncio.gather(
+            *app.bot_data["tasks"],
+            return_exceptions=True,
+        )
+
     for ex in app.bot_data.get("exchanges", []):
-        await ex.close()
+        try:
+            await ex.close()
+
+        except Exception:
+            log.exception(
+                "Ошибка закрытия %s",
+                ex.id,
+            )
 
 
 def main():
     cfg = load_config()
-    cfg.setdefault("chats", {})
+
+    cfg.setdefault(
+        "chats",
+        {},
+    )
+
     token = get_token(cfg)
 
     app = (
@@ -913,19 +2355,44 @@ def main():
         .post_shutdown(post_shutdown)
         .build()
     )
+
     app.bot_data["cfg"] = cfg
-    app.add_handler(CommandHandler("search", search_cmd))
-    app.add_handler(CommandHandler("minsize", minsize_cmd))
-    app.add_handler(CommandHandler("enable", enable_cmd))
-    app.add_handler(CommandHandler("disable", disable_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("stop", stop_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    app.add_handler(
+        CommandHandler("search", search_cmd)
+    )
+
+    app.add_handler(
+        CommandHandler("minsize", minsize_cmd)
+    )
+
+    app.add_handler(
+        CommandHandler("enable", enable_cmd)
+    )
+
+    app.add_handler(
+        CommandHandler("disable", disable_cmd)
+    )
+
+    app.add_handler(
+        CommandHandler("status", status_cmd)
+    )
+
+    app.add_handler(
+        CommandHandler("stop", stop_cmd)
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            on_text,
+        )
+    )
+
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
 
 
 if __name__ == "__main__":
     main()
-
-9194a5098588976427d2b383bdd169
-89441c59cb3d5aca98356db0f08afdcf1a174e8142ae40ba8b6c969030aa0080
