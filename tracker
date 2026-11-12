@@ -30,7 +30,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 HORIZON_MIN = 15            # горизонт прогноза
 TOP_N = 12                  # сколько самых ликвидных фьючерсов анализировать (если /tokens не задан)
 MIN_QUOTE_VOL = 50_000_000  # мин. 24ч-объём в USDT (фильтр низкой ликвидности)
-MIN_CONF = 0.40             # слать сигнал, только если у лучшего сценария вероятность >= 40%
+MIN_CONF = 0.34             # слать сигнал, если у лучшего сценария вероятность >= 34% (0.34 = почти всегда; подними до 0.40-0.45, чтобы получать реже)
 MAX_PER_CYCLE = 5           # макс. сигналов за один цикл (антиспам)
 FLAT_K = 0.30               # «Бок» = движение меньше 0.30 от типичного 15м-разброса (σ)
 MU_SCALE = 0.35             # насколько сильно оценка факторов сдвигает прогноз (на 15м рынок почти случаен)
@@ -309,6 +309,9 @@ async def run_cycle(app, chat_ids=None):
             auto = await BN.top_symbols(TOP_N)
         except Exception as e:
             log.warning("не получил список токенов: %s", e)
+            if chat_ids is not None:
+                for cid in chat_ids:
+                    await app.bot.send_message(cid, f"⚠️ Не смог получить данные Binance: {e}\nЕсли ошибка 451/403 — Binance блокирует IP сервера, нужен другой сервер или VPN.")
             return
         wanted = set()
         for c in chats:
@@ -328,6 +331,11 @@ async def run_cycle(app, chat_ids=None):
                     log.warning("%s ошибка: %s", sym, e)
 
         await asyncio.gather(*(one(s) for s in wanted))
+        log.info("цикл: проанализировано %d из %d токенов; лучшие уверенности: %s", len(results), len(wanted),
+                 sorted((round(max(r["p"].values()), 3) for r in results.values()), reverse=True)[:5])
+        if not results and chat_ids is not None:
+            for cid in chat_ids:
+                await app.bot.send_message(cid, "⚠️ Ни по одному токену нет данных (смотри консоль бота: причина пишется там).")
 
         for c in chats:
             cands = []
