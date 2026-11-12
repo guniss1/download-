@@ -106,8 +106,9 @@ class Binance:
 
     async def price_at(self, s, due_ts):
         """Цена закрытия 1м-свечи, закрывшейся ровно в due_ts."""
+        # последняя 1м-свеча, открывшаяся до due_ts (если в ту минуту сделок не было, берём предыдущую)
         k = await self.get("/fapi/v1/klines", symbol=s, interval="1m",
-                           startTime=(due_ts - 60) * 1000, limit=1)
+                           endTime=(due_ts - 1) * 1000, limit=1)
         if not k:
             raise BadData("нет свечи экспирации")
         return float(k[0][4])
@@ -174,9 +175,12 @@ def compute(d, now_ms):
     # --- контроль качества данных ---
     if len(k15) < 100 or len(k1h) < 55 or len(k1) < 20:
         raise BadData("мало свечей")
-    for kl, step in ((k15, 900_000), (k1h, 3_600_000), (k1, 60_000)):
-        if any(b[0] - a[0] != step for a, b in zip(kl[-30:], kl[-29:])):
-            raise BadData("пропуски в свечах")
+    # Binance не рисует свечу за период без сделок: небольшие пропуски — норма для менее ликвидных токенов
+    for name, kl, step, max_gaps in (("15м", k15, 900_000, 1), ("1ч", k1h, 3_600_000, 1), ("1м", k1, 60_000, 3)):
+        window = kl[-30:]
+        missing = (window[-1][0] - window[0][0]) // step + 1 - len(window)
+        if missing > max_gaps:
+            raise BadData(f"пропуски в свечах {name}: нет {missing} из последних 30")
     if now_ms - k1[-1][6] > 180_000:
         raise BadData("данные устарели")
     bids, asks = d["depth"]["bids"], d["depth"]["asks"]
@@ -250,7 +254,7 @@ def compute(d, now_ms):
     p, thr = probs_from(mu, sigma)
     top = sorted(parts.items(), key=lambda kv: -abs(kv[1]))[:2]
     return {"price": price, "p": p, "thr": thr, "sigma": sigma, "score": score,
-            "entry_ts": round(k1[-1][6] / 1000),
+            "entry_ts": now_ms // 60000 * 60,
             "reasons": ", ".join(f"{n} {v:+.2f}" for n, v in top)}
 
 
