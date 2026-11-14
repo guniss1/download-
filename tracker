@@ -878,13 +878,17 @@ async def scanner_loop(app: Application):
                         if mode == "false" and assessment["status"] is not False:
                             continue
                         a["transfer"] = assessment["status"]
+                        # На этом этапе find_anomalies ещё не формирует buys_shown/sells_shown:
+                        # они создаются позже, после проверки стаканов. Используем исходные
+                        # списки бирж-кандидатов; fmt_side покажет статусы только для бирж,
+                        # которые фактически попадут в итоговый сигнал.
                         a["buy_states"] = {
                             ex: (side_info(currencies, ex, base, "withdraw") or {}).get("ok")
-                            for ex, _, _ in a["buys_shown"]
+                            for ex, _, _ in a["buys"]
                         }
                         a["sell_states"] = {
                             ex: (side_info(currencies, ex, base, "deposit") or {}).get("ok")
-                            for ex, _, _ in a["sells_shown"]
+                            for ex, _, _ in a["sells"]
                         }
                         lst.append((ckey, a))
 
