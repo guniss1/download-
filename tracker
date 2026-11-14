@@ -17,8 +17,9 @@
     4. /minsize 100             - не показывать сигналы, где можно провернуть меньше $100.
     5. /disable binance bybit   - выключить биржи (только в этой группе).
     6. /enable binance bybit    - включить обратно (/enable all - включить все).
-    7. /transfer true|false|all - показывать только токены, которые можно (true) / нельзя (false)
-                                  передать между биржами; all - все (по умолчанию).
+    7. /transfer true|true null|false|all - фильтр по доступности перевода.
+       true - только подтверждённо доступные; true null - доступные и неизвестные;
+       false - только недоступные; all - все.
     8. /status - текущие настройки, /stop - отключить уведомления в этой группе.
 
 Как читать сообщение:
@@ -28,13 +29,9 @@
                                       ордера подписана биржа
     N) Биржа +x%: цена: [$цена:$сумма]: кол-во - один ордер (сумма: K - тысячи, M - миллионы)
     Купля / Продажа                 - до 3 лучших бирж, цена (или диапазон цен), суточный объём
-    Доступ к выводу                 - 🟢 монету можно вывести с биржи покупки и ввести на бирже
-                                      продажи (есть общая сеть); 🔴 точно нельзя; 🟡 одна сторона
-                                      открыта, по другой бирже данных нет; ⚪ данных нет совсем
-    Если у биржи нет собственных данных о монете, в строке «Доступ к выводу» показан статус вывода
-    на биржах, которые отдают его публично (или по вашим API-ключам). Открыт везде - считаем, что
-    и на нужной бирже можно (🟢). Закрыт везде - токен не рассматривается 3 часа
-    (кроме режима /transfer false).
+    Кружок перед биржей - 🟢 вывод/ввод доступен, 🔴 закрыт, ⚪ нет достоверных данных.
+    Кружок в заголовке сигнала 🟢 означает, что вывод на бирже покупки и ввод на бирже
+    продажи подтверждены и между сетями есть совпадение.
 
 Статус вывода/ввода бот пробует получить у КАЖДОЙ биржи без ключей (публичные эндпоинты).
 У тех, где это невозможно (обычно Bybit, OKX, MEXC, BingX), он берётся только по API-ключам.
@@ -120,7 +117,7 @@ CURRENCY_TTL = 1800        # как часто обновлять статусы
 CURRENCY_RETRY = 300       # через сколько повторить, если получить не удалось
 CURRENCY_PARALLEL = 8      # сколько бирж опрашивать одновременно
 MIN_SOURCES = 2            # минимум бирж со статусом монеты для вывода "везде открыт / везде закрыт"
-MAX_SOURCES_SHOWN = 6      # сколько бирж показывать в строке «Доступ к выводу»
+MAX_SOURCES_SHOWN = 6      # оставлено для совместимости конфигурации
 DEAD_TTL = 3 * 3600        # на сколько секунд скрывать токен, закрытый для вывода везде
 
 # Ссылки на спотовую пару на каждой бирже. Часть шаблонов составлена по памяти и НЕ проверена:
@@ -518,6 +515,13 @@ CURRENCY_OVERRIDE = {
     "bitget": bitget_currencies,
 }
 
+# Для этих бирж CCXT не используем как источник статусов ввода/вывода.
+# При отсутствии отдельного публичного адаптера статус остаётся неизвестным (⚪).
+NO_CCXT_CURRENCIES = {
+    "coinw", "coinex", "coinstore", "bitmart", "ascendex",
+    "probit", "coincatch", "bitvenus",
+}
+
 
 async def load_currencies(ex):
     """Сначала прямой публичный эндпоинт (если известен), затем ccxt fetch_currencies:
@@ -525,7 +529,8 @@ async def load_currencies(ex):
     loaders = []
     if ex.id in CURRENCY_OVERRIDE:
         loaders.append(lambda: CURRENCY_OVERRIDE[ex.id](ex))
-    loaders.append(lambda: ex.fetch_currencies())
+    if ex.id not in NO_CCXT_CURRENCIES:
+        loaders.append(lambda: ex.fetch_currencies())
 
     errors = []
     for load in loaders:
@@ -660,30 +665,26 @@ def is_dead(currencies, dead_until, base, now):
 
 
 def assess_transfer(currencies, buy_ex, sell_ex, base):
-    """Итог: {'status': True|False|'partial'|None, 'public': {биржа: True|False} | None}.
-    Сначала точные данные бирж покупки (вывод) и продажи (ввод). Если по одной из них данных нет,
-    опираемся на остальные биржи: открыт везде -> считаем, что можно; закрыт везде -> нельзя."""
+    """Проверяет именно маршрут: вывод с биржи покупки + ввод на бирже продажи.
+    True/False только при достаточных данных; None означает, что подтвердить нельзя."""
     w = side_info(currencies, buy_ex, base, "withdraw")
     d = side_info(currencies, sell_ex, base, "deposit")
 
-    if (w and not w["ok"]) or (d and not d["ok"]):
-        return {"status": False, "public": None}
-    if w is not None and d is not None:
+    if (w is not None and not w["ok"]) or (d is not None and not d["ok"]):
+        status = False
+    elif w is not None and d is not None:
         if w["nets"] is not None and d["nets"] is not None:
-            ok = any(a & b for a in w["nets"] for b in d["nets"])
+            status = any(a & b for a in w["nets"] for b in d["nets"])
         else:
-            ok = True
-        return {"status": ok, "public": None}
-
-    public = source_states(currencies, base)
-    inferred = infer_public(public)
-    if inferred is not None:
-        status = inferred
-    elif w is not None or d is not None or public:
-        status = "partial"
+            status = True
     else:
         status = None
-    return {"status": status, "public": public or None}
+
+    return {
+        "status": status,
+        "buy_status": w["ok"] if w is not None else None,
+        "sell_status": d["ok"] if d is not None else None,
+    }
 
 
 # ---------- Форматирование ----------
@@ -751,16 +752,18 @@ def status_emoji(status):
     return {True: "🟢", False: "🔴", "partial": "🟡"}.get(status, "⚪")
 
 
-def fmt_side(title, entries, stats, symbol, sell):
+def fmt_side(title, entries, stats, symbol, sell, transfer_states=None):
     """entries: [(биржа, лучшая цена, объём 24ч)], stats: цены использованных уровней по биржам."""
     parts = []
+    transfer_states = transfer_states or {}
     for ex_id, best, vol in entries:
         st = stats.get(ex_id)
         if st:
             rng = price_range(st["hi"], st["lo"]) if sell else price_range(st["lo"], st["hi"])
         else:
             rng = fmt_price(best)
-        parts.append(f"{ex_link(ex_id, symbol)} {rng} (24vol ${fmt_vol(vol)})")
+        dot = pub_emoji(transfer_states.get(ex_id))
+        parts.append(f"{dot} {ex_link(ex_id, symbol)} {rng} (24vol ${fmt_vol(vol)})")
     if len(parts) == 1:
         return [f" • <b>{title}:</b> {parts[0]}"]
     return [f" • <b>{title}:</b>"] + [f"{n}) {p}" for n, p in enumerate(parts, 1)]
@@ -784,18 +787,10 @@ def fmt_anomaly(a):
         )
     if len(orders) > MAX_ORDER_LINES:
         body.append(f"…и ещё {len(orders) - MAX_ORDER_LINES}")
-    body += fmt_side("Купля", a["buys_shown"], a["buy_stats"], a["symbol"], sell=False)
-    body += fmt_side("Продажа", a["sells_shown"], a["sell_stats"], a["symbol"], sell=True)
-
-    if a.get("public"):
-        # закрытые биржи показываем первыми, чтобы они не потерялись при обрезке списка
-        items = sorted(a["public"].items(), key=lambda kv: kv[1] is True)
-        shown = ", ".join(f"{EX_NAMES.get(ex, ex)} {pub_emoji(st)}" for ex, st in items[:MAX_SOURCES_SHOWN])
-        if len(items) > MAX_SOURCES_SHOWN:
-            shown += f" (+{len(items) - MAX_SOURCES_SHOWN})"
-        body.append(f" • <b>Доступ к выводу:</b> {shown}")
-    else:
-        body.append(f" • <b>Доступ к выводу:</b> {status_emoji(a['transfer'])}")
+    body += fmt_side("Купля", a["buys_shown"], a["buy_stats"], a["symbol"], sell=False,
+                     transfer_states=a.get("buy_states"))
+    body += fmt_side("Продажа", a["sells_shown"], a["sell_stats"], a["symbol"], sell=True,
+                     transfer_states=a.get("sell_states"))
 
     return header + "\n<blockquote>" + "\n".join(body) + "</blockquote>"
 
@@ -878,10 +873,19 @@ async def scanner_loop(app: Application):
                         assessment = assess_transfer(currencies, a["buy_ex"], a["sell_ex"], base)
                         if mode == "true" and assessment["status"] is not True:
                             continue
+                        if mode == "true_null" and assessment["status"] is False:
+                            continue
                         if mode == "false" and assessment["status"] is not False:
                             continue
                         a["transfer"] = assessment["status"]
-                        a["public"] = assessment["public"]
+                        a["buy_states"] = {
+                            ex: (side_info(currencies, ex, base, "withdraw") or {}).get("ok")
+                            for ex, _, _ in a["buys_shown"]
+                        }
+                        a["sell_states"] = {
+                            ex: (side_info(currencies, ex, base, "deposit") or {}).get("ok")
+                            for ex, _, _ in a["sells_shown"]
+                        }
                         lst.append((ckey, a))
 
                         entry = cand_all.setdefault(ckey, [a["pct"], []])
@@ -1005,7 +1009,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"если по стаканам можно провернуть от ${c.get('min_trade_usdt', MIN_TRADE_USDT):g}.\n"
             "Порог: /search 0.5%\n"
             "Минимальный объём: /minsize 100\n"
-            "Только переводимые / непереводимые токены: /transfer true | false | all\n"
+            "Фильтр перевода: /transfer true | true null | false | all\n"
             "Биржи: /disable binance bybit, /enable binance bybit\n"
             "Настройки: /status"
         )
@@ -1073,23 +1077,34 @@ async def transfer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat is None:
         await msg.reply_text("Сначала напишите в чате: «трекер, ты тут?»")
         return
-    names = {"all": "all", "все": "all", "off": "all",
-             "true": "true", "1": "true", "yes": "true", "да": "true",
-             "false": "false", "0": "false", "no": "false", "нет": "false"}
+
+    names = {
+        "all": "all", "все": "all", "off": "all",
+        "true": "true", "1": "true", "yes": "true", "да": "true",
+        "false": "false", "0": "false", "no": "false", "нет": "false",
+    }
     texts = {
         "all": "Показываю все токены.",
-        "true": "Показываю только токены, которые можно передать между биржами (🟢).",
-        "false": "Показываю только токены, которые нельзя передать (🔴).",
+        "true": "Показываю только токены с подтверждённым переводом (🟢).",
+        "true_null": "Показываю токены с подтверждённым переводом (🟢) и без данных (⚪); закрытые (🔴) скрываю.",
+        "false": "Показываю только токены, по которым перевод закрыт (🔴).",
     }
-    arg = context.args[0].lower() if context.args else ""
-    if arg not in names:
+    args = [x.lower() for x in context.args]
+    arg = names.get(args[0], "") if args else ""
+    if arg == "true" and len(args) > 1 and args[1] == "null":
+        arg = "true_null"
+
+    if not arg:
+        current = chat.get("transfer", "all")
         await msg.reply_text(
-            texts[chat.get("transfer", "all")] + "\nИзменить: /transfer true, /transfer false, /transfer all"
+            texts.get(current, texts["all"])
+            + "\nИзменить: /transfer true, /transfer true null, /transfer false, /transfer all"
         )
         return
-    chat["transfer"] = names[arg]
+    chat["transfer"] = arg
     save_config(cfg)
-    await msg.reply_text(texts[names[arg]])
+    await msg.reply_text(texts[arg])
+
 
 
 def parse_names(args):
@@ -1183,8 +1198,10 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     store = bd.get("currencies", {})
     known = [e for e in enabled if (store.get(e) or {}).get("cur")]
     unknown = [e for e in enabled if e not in known and e not in missing]
-    tmode = {"all": "все токены", "true": "только переводимые (🟢)", "false": "только непереводимые (🔴)"}
-    lines.append("Фильтр перевода: " + tmode[chat.get("transfer", "all")])
+    tmode = {"all": "все токены", "true": "только подтверждённо переводимые (🟢)",
+             "true_null": "переводимые (🟢) и без данных (⚪)",
+             "false": "только непереводимые (🔴)"}
+    lines.append("Фильтр перевода: " + tmode.get(chat.get("transfer", "all"), "все токены"))
     lines.append("Статус вывода известен: " + (", ".join(known) or "ни для одной биржи"))
     if unknown:
         lines.append("Статус вывода неизвестен (нужны API-ключи на чтение): " + ", ".join(unknown))
