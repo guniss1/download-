@@ -23,10 +23,14 @@
     8. /status - текущие настройки, /stop - отключить уведомления в этой группе.
 
 Как читать сообщение:
-    INIT/USDT [+6.5%:+6.6%] 🔴      - диапазон разницы цен по выгодным ордерам, статус вывода
-    Выгодных ордеров                - уровни стаканов на покупке (с до 3 лучших бирж), где разница
+    INIT/USDT [+6.5%:+6.6%] 🔴      - диапазон разницы цен по ордерам на покупку, статус вывода
+    150$ -> 155$                    - сколько потратим на всех ордерах на покупку и сколько получим
+                                      на всех ордерах на продажу (считается только по этим ордерам)
+    Ордера на покупку               - уровни стаканов на покупке (с до 3 лучших бирж), где разница
                                       с лучшими ценами продажи не меньше порога /search; у каждого
                                       ордера подписана биржа
+    Ордера на продажу               - уровни стаканов на продаже (с до 3 лучших бирж), в которые
+                                      уходят эти же монеты; маржа - к цене покупки тех же монет
     N) Биржа +x%: цена: [$цена:$сумма]: кол-во - один ордер (сумма: K - тысячи, M - миллионы)
     Купля / Продажа                 - до 3 лучших бирж, цена (или диапазон цен), суточный объём
     Кружок перед биржей - 🟢 вывод/ввод доступен, 🔴 закрыт, ⚪ нет достоверных данных.
@@ -344,7 +348,8 @@ def depth_orders(asks, bids, thr_pct):
     """asks/bids - склеенные списки (цена, кол-во, биржа). Идём навстречу друг другу:
     покупаем по самым дешёвым ask, продаём по самым дорогим bid, пока разница цен на текущей
     паре уровней не меньше thr_pct. Возвращает выгодные ордера (с биржей) и итоги или None."""
-    orders = []
+    orders = []        # ордера на покупку (уровни ask)
+    sell_orders = []   # ордера на продажу (уровни bid)
     buy_stats, sell_stats = {}, {}
     cost = revenue = qty_total = 0.0
     i = j = 0
@@ -364,6 +369,12 @@ def depth_orders(asks, bids, thr_pct):
             orders.append({"i": i, "ex": ea, "price": pa, "qty": 0.0, "rev": 0.0})
         orders[-1]["qty"] += take
         orders[-1]["rev"] += take * pb
+
+        if not sell_orders or sell_orders[-1]["j"] != j:
+            sell_orders.append({"j": j, "ex": eb, "price": pb, "qty": 0.0, "cost": 0.0})
+        sell_orders[-1]["qty"] += take
+        sell_orders[-1]["cost"] += take * pa
+
         cost += take * pa
         revenue += take * pb
         qty_total += take
@@ -387,8 +398,13 @@ def depth_orders(asks, bids, thr_pct):
         return None
     for o in orders:
         o["margin"] = (o["rev"] / (o["qty"] * o["price"]) - 1) * 100
+    sell_orders = [o for o in sell_orders if o["qty"] > 0 and o["cost"] > 0]
+    for o in sell_orders:
+        # маржа ордера на продажу: выручка по его цене против того, что заплатили за те же монеты
+        o["margin"] = (o["qty"] * o["price"] / o["cost"] - 1) * 100
     return {
         "orders": orders,
+        "sell_orders": sell_orders,
         "usdt": cost,                 # на сколько $ можно купить
         "qty": qty_total,
         "revenue": revenue,
@@ -769,30 +785,49 @@ def fmt_side(title, entries, stats, symbol, sell, transfer_states=None):
     return [f" • <b>{title}:</b>"] + [f"{n}) {p}" for n, p in enumerate(parts, 1)]
 
 
+def fmt_money(x):
+    """Сумма в долларах: от 100 - без копеек, с разделителем тысяч."""
+    return f"{x:,.0f}".replace(",", " ") if x >= 100 else f"{x:.2f}"
+
+
+def fmt_order_lines(title, orders, base):
+    """Раздел с ордерами: заголовок с количеством и строки 'N) Биржа +x%: цена: [$цена:$сумма]: кол-во'."""
+    lines = [f" • <b>{title}:</b> {len(orders)}"]
+    for n, o in enumerate(orders[:MAX_ORDER_LINES], 1):
+        amount = o["qty"] * o["price"]
+        lines.append(
+            f"{n}) {EX_NAMES.get(o['ex'], o['ex'])} +{trunc1(o['margin']):.1f}%: "
+            f"{fmt_price(o['price'])}: [${short_price(o['price'])}:${fmt_k(amount)}]: "
+            f"{qty_str(o['qty'])} {base}"
+        )
+    if len(orders) > MAX_ORDER_LINES:
+        lines.append(f"…и ещё {len(orders) - MAX_ORDER_LINES}")
+    return lines
+
+
 def fmt_anomaly(a):
     orders = a["orders"]
+    sell_orders = a["sell_orders"]
     base = a["symbol"].split("/")[0]
     margins = [o["margin"] for o in orders]
     lo, hi = trunc1(min(margins)), trunc1(max(margins))
 
     header = f"<b>{a['symbol']} [+{lo:.1f}%:+{hi:.1f}%]</b> {status_emoji(a['transfer'])}"
 
-    body = [f" • <b>Выгодных ордеров:</b> {len(orders)}"]
-    for n, o in enumerate(orders[:MAX_ORDER_LINES], 1):
-        amount = o["qty"] * o["price"]
-        body.append(
-            f"{n}) {EX_NAMES.get(o['ex'], o['ex'])} +{trunc1(o['margin']):.1f}%: "
-            f"{fmt_price(o['price'])}: [${short_price(o['price'])}:${fmt_k(amount)}]: "
-            f"{qty_str(o['qty'])} {base}"
-        )
-    if len(orders) > MAX_ORDER_LINES:
-        body.append(f"…и ещё {len(orders) - MAX_ORDER_LINES}")
+    # Сколько потратим -> сколько получим: считается только по ордерам на покупку и на продажу
+    # (все ордера, в том числе свёрнутые в «…и ещё N»). '>' в HTML Telegram экранируется.
+    spent = sum(o["qty"] * o["price"] for o in orders)
+    received = sum(o["qty"] * o["price"] for o in sell_orders)
+    flow = f"{fmt_money(spent)}$ -&gt; {fmt_money(received)}$"
+
+    body = fmt_order_lines("Ордера на покупку", orders, base)
+    body += fmt_order_lines("Ордера на продажу", sell_orders, base)
     body += fmt_side("Купля", a["buys_shown"], a["buy_stats"], a["symbol"], sell=False,
                      transfer_states=a.get("buy_states"))
     body += fmt_side("Продажа", a["sells_shown"], a["sell_stats"], a["symbol"], sell=True,
                      transfer_states=a.get("sell_states"))
 
-    return header + "\n<blockquote>" + "\n".join(body) + "</blockquote>"
+    return header + "\n" + flow + "\n<blockquote>" + "\n".join(body) + "</blockquote>"
 
 
 def chunk_blocks(items):
