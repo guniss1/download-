@@ -1,1 +1,312 @@
+#!/usr/bin/env python3
+"""
+Сканер базиса: спот vs бессрочный фьючерс (USDT-маржа) на Binance, Bybit, OKX.
+Стратегия: лонг спот + шорт перп, когда фьюч дороже спота.
+Алерты уходят в Telegram.
+
+Запуск:
+    pip install requests
+    export TG_TOKEN="123:ABC"
+    export TG_CHAT_ID="-100123456789"      # можно несколько через запятую
+    python basis_scanner.py
+
+Команды в чате: /search 1.5  (мин. базис, %)   /status   /help
+"""
+import os
+import time
+import logging
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+
+import requests
+
+TG_TOKEN = os.getenv("TG_TOKEN", "")
+TG_CHATS = [c.strip() for c in os.getenv("TG_CHAT_ID", "").split(",") if c.strip()]
+
+CFG = {
+    "min_basis": 1.0,      # % минимальный базис (грязный, до комиссий)
+    "max_basis": 25.0,     # % выше этого почти всегда мусор/баг сопоставления
+    "min_vol": 200_000,    # USDT, оборот спота за 24ч
+    "min_size": 200,       # USD, объём на лучшей цене стакана (мин. из двух ног)
+    "interval": 30,        # сек между сканами
+    "cooldown": 1800,      # сек до повторного алерта по той же паре
+    "regrow": 1.0,         # п.п.: повторный алерт раньше кулдауна, если базис вырос
+    "top_n": 10,           # макс. алертов за один скан
+}
+
+# Taker-комиссии в % (спот, фьючерс). Поправь под свой VIP-уровень.
+FEES = {
+    "Binance": (0.10, 0.05),
+    "Bybit": (0.10, 0.055),
+    "OKX": (0.10, 0.05),
+}
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("scanner")
+SESSION = requests.Session()
+SESSION.headers["User-Agent"] = "basis-scanner/1.0"
+
+
+def get(url, params=None, timeout=10):
+    r = SESSION.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def fl(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def book(bid, bid_qty, ask, ask_qty, vol=0.0, fund=None, nxt=None):
+    return {
+        "bid": fl(bid), "bid_qty": fl(bid_qty),
+        "ask": fl(ask), "ask_qty": fl(ask_qty),
+        "vol": fl(vol), "fund": fund, "next": nxt,
+    }
+
+
+# ───────────────────────────── Binance ─────────────────────────────
+def binance():
+    with ThreadPoolExecutor(3) as ex:
+        a = ex.submit(get, "https://api.binance.com/api/v3/ticker/24hr")
+        b = ex.submit(get, "https://fapi.binance.com/fapi/v1/ticker/bookTicker")
+        c = ex.submit(get, "https://fapi.binance.com/fapi/v1/premiumIndex")
+    spot, fut = {}, {}
+    for t in a.result():
+        s = t["symbol"]
+        if s.endswith("USDT"):
+            spot[s[:-4]] = book(t["bidPrice"], t["bidQty"], t["askPrice"], t["askQty"], t["quoteVolume"])
+    for t in b.result():
+        s = t["symbol"]
+        if s.endswith("USDT") and "_" not in s:
+            fut[s[:-4]] = book(t["bidPrice"], t["bidQty"], t["askPrice"], t["askQty"])
+    for t in c.result():
+        s = t["symbol"]
+        if s.endswith("USDT") and "_" not in s and s[:-4] in fut:
+            fut[s[:-4]]["fund"] = fl(t.get("lastFundingRate")) * 100
+            fut[s[:-4]]["next"] = t.get("nextFundingTime")
+    return spot, fut
+
+
+# ───────────────────────────── Bybit ─────────────────────────────
+def bybit():
+    with ThreadPoolExecutor(2) as ex:
+        a = ex.submit(get, "https://api.bybit.com/v5/market/tickers", {"category": "spot"})
+        b = ex.submit(get, "https://api.bybit.com/v5/market/tickers", {"category": "linear"})
+    spot, fut = {}, {}
+    for t in a.result()["result"]["list"]:
+        s = t["symbol"]
+        if s.endswith("USDT"):
+            spot[s[:-4]] = book(t["bid1Price"], t["bid1Size"], t["ask1Price"], t["ask1Size"], t["turnover24h"])
+    for t in b.result()["result"]["list"]:
+        s = t["symbol"]
+        if s.endswith("USDT") and "-" not in s:
+            fut[s[:-4]] = book(
+                t["bid1Price"], t["bid1Size"], t["ask1Price"], t["ask1Size"],
+                fund=fl(t.get("fundingRate")) * 100, nxt=t.get("nextFundingTime"),
+            )
+    return spot, fut
+
+
+# ───────────────────────────── OKX ─────────────────────────────
+_okx_ct = {"ts": 0, "data": {}}
+
+
+def okx_ctval():
+    """Размер контракта (монет в 1 контракте) для USDT-перпов. Кэш на час."""
+    if time.time() - _okx_ct["ts"] > 3600 or not _okx_ct["data"]:
+        d = get("https://www.okx.com/api/v5/public/instruments", {"instType": "SWAP"})["data"]
+        _okx_ct["data"] = {
+            i["instId"]: fl(i["ctVal"]) for i in d if i["instId"].endswith("-USDT-SWAP")
+        }
+        _okx_ct["ts"] = time.time()
+    return _okx_ct["data"]
+
+
+def okx():
+    ct = okx_ctval()
+    with ThreadPoolExecutor(2) as ex:
+        a = ex.submit(get, "https://www.okx.com/api/v5/market/tickers", {"instType": "SPOT"})
+        b = ex.submit(get, "https://www.okx.com/api/v5/market/tickers", {"instType": "SWAP"})
+    spot, fut = {}, {}
+    for t in a.result()["data"]:
+        i = t["instId"]
+        if i.endswith("-USDT") and i.count("-") == 1:
+            spot[i.split("-")[0]] = book(t["bidPx"], t["bidSz"], t["askPx"], t["askSz"], t["volCcy24h"])
+    for t in b.result()["data"]:
+        i = t["instId"]
+        if i.endswith("-USDT-SWAP") and i in ct:
+            m = ct[i]
+            fut[i.split("-")[0]] = book(t["bidPx"], fl(t["bidSz"]) * m, t["askPx"], fl(t["askSz"]) * m)
+    return spot, fut
+
+
+def okx_funding(base):
+    try:
+        d = get("https://www.okx.com/api/v5/public/funding-rate", {"instId": f"{base}-USDT-SWAP"})["data"][0]
+        return fl(d["fundingRate"]) * 100, d.get("nextFundingTime")
+    except Exception as e:
+        log.warning("OKX funding %s: %s", base, e)
+        return None, None
+
+
+EXCHANGES = {"Binance": binance, "Bybit": bybit, "OKX": okx}
+
+
+# ───────────────────────────── Логика ─────────────────────────────
+def scan():
+    found = []
+    with ThreadPoolExecutor(len(EXCHANGES)) as ex:
+        futs = {n: ex.submit(fn) for n, fn in EXCHANGES.items()}
+    for name, fu in futs.items():
+        try:
+            spot, fut = fu.result()
+        except Exception as e:
+            log.warning("%s: ошибка запроса: %s", name, e)
+            continue
+        fee_s, fee_f = FEES[name]
+        for base, f in fut.items():
+            s = spot.get(base)
+            if not s or s["ask"] <= 0 or f["bid"] <= 0:
+                continue
+            basis = (f["bid"] - s["ask"]) / s["ask"] * 100
+            if basis < CFG["min_basis"] or basis > CFG["max_basis"]:
+                continue
+            if s["vol"] < CFG["min_vol"]:
+                continue
+            size = min(s["ask"] * s["ask_qty"], f["bid"] * f["bid_qty"])
+            if size < CFG["min_size"]:
+                continue
+            fees_rt = 2 * (fee_s + fee_f)  # вход + выход, обе ноги
+            found.append({
+                "ex": name, "base": base, "basis": basis, "net": basis - fees_rt,
+                "spot_ask": s["ask"], "fut_bid": f["bid"], "vol": s["vol"],
+                "size": size, "fund": f["fund"], "next": f["next"],
+            })
+    found.sort(key=lambda x: x["net"], reverse=True)
+    found = found[: CFG["top_n"] * 3]
+    for r in found:  # у OKX funding тянем только для кандидатов
+        if r["ex"] == "OKX" and r["fund"] is None:
+            r["fund"], r["next"] = okx_funding(r["base"])
+    return found
+
+
+def fmt_price(p):
+    return f"{p:.6g}"
+
+
+def fmt_usd(v):
+    return f"${v / 1e6:.2f}M" if v >= 1e6 else f"${v / 1e3:.0f}K" if v >= 1e3 else f"${v:.0f}"
+
+
+def fmt_msg(r):
+    icon = "🟢" if r["net"] > 0 else "🔴"
+    lines = [
+        f"<b>{r['base']} [+{r['basis']:.2f}%] {icon}</b> — {r['ex']}",
+        "<blockquote>"
+        f"Спот ask: {fmt_price(r['spot_ask'])}\n"
+        f"Перп bid: {fmt_price(r['fut_bid'])}\n"
+        f"Базис: +{r['basis']:.2f}% | после комиссий (вход+выход): {r['net']:+.2f}%\n"
+    ]
+    if r["fund"] is not None:
+        when = ""
+        if r["next"]:
+            when = datetime.fromtimestamp(fl(r["next"]) / 1000, timezone.utc).strftime(" до %H:%M UTC")
+        who = "шорт получает" if r["fund"] > 0 else "шорт платит"
+        lines[-1] += f"Funding: {r['fund']:+.4f}%{when} ({who})\n"
+    lines[-1] += f"Объём спота 24ч: {fmt_usd(r['vol'])} | на лучшей цене: {fmt_usd(r['size'])}</blockquote>"
+    return "".join(lines)
+
+
+# ───────────────────────────── Telegram ─────────────────────────────
+def tg_send(text):
+    if not TG_TOKEN:
+        print(text, "\n")
+        return
+    for chat in TG_CHATS:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                json={"chat_id": chat, "text": text, "parse_mode": "HTML",
+                      "disable_web_page_preview": True},
+                timeout=10,
+            )
+        except Exception as e:
+            log.warning("Telegram: %s", e)
+
+
+_offset = 0
+
+
+def poll_commands(timeout=5):
+    global _offset
+    if not TG_TOKEN:
+        time.sleep(timeout)
+        return
+    try:
+        upd = get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates",
+                  {"offset": _offset, "timeout": timeout}, timeout=timeout + 5)["result"]
+    except Exception as e:
+        log.warning("getUpdates: %s", e)
+        time.sleep(timeout)
+        return
+    for u in upd:
+        _offset = u["update_id"] + 1
+        m = u.get("message") or {}
+        text = (m.get("text") or "").strip()
+        chat = str(m.get("chat", {}).get("id", ""))
+        if not text.startswith("/") or (TG_CHATS and chat not in TG_CHATS):
+            continue
+        cmd, *args = text.split()
+        cmd = cmd.split("@")[0].lower()
+        if cmd == "/search" and args:
+            try:
+                CFG["min_basis"] = float(args[0].replace("%", "").replace(",", "."))
+                tg_send(f"Мин. базис: {CFG['min_basis']}%")
+            except ValueError:
+                tg_send("Пример: /search 1.5")
+        elif cmd == "/status":
+            tg_send(
+                f"Биржи: {', '.join(EXCHANGES)}\n"
+                f"Мин. базис: {CFG['min_basis']}% | макс: {CFG['max_basis']}%\n"
+                f"Мин. объём спота: {fmt_usd(CFG['min_vol'])} | мин. размер: {fmt_usd(CFG['min_size'])}\n"
+                f"Интервал: {CFG['interval']}с | кулдаун: {CFG['cooldown']}с"
+            )
+        elif cmd in ("/help", "/start"):
+            tg_send("/search 1.5 — мин. базис в %\n/status — текущие настройки")
+
+
+# ───────────────────────────── Main ─────────────────────────────
+def main():
+    sent = {}  # (ex, base) -> (time, basis)
+    log.info("Старт. Биржи: %s", ", ".join(EXCHANGES))
+    while True:
+        t0 = time.time()
+        try:
+            n = 0
+            for r in scan():
+                key = (r["ex"], r["base"])
+                last = sent.get(key)
+                fresh = (
+                    last is None
+                    or t0 - last[0] > CFG["cooldown"]
+                    or r["basis"] >= last[1] + CFG["regrow"]
+                )
+                if not fresh or n >= CFG["top_n"]:
+                    continue
+                tg_send(fmt_msg(r))
+                sent[key] = (t0, r["basis"])
+                n += 1
+            log.info("Скан готов, алертов: %d", n)
+        except Exception as e:
+            log.exception("Сбой скана: %s", e)
+        while time.time() - t0 < CFG["interval"]:
+            poll_commands(min(5, max(1, int(CFG["interval"] - (time.time() - t0)))))
+
+
+if __name__ == "__main__":
+    main()
 
